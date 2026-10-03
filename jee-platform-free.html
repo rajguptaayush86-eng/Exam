@@ -1,0 +1,1771 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>ExamForge Free</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body style="margin:0">
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+// ExamForge Free v6 - Official Exam UIs + Working Upgrade + Fixed Palette
+
+const CTRL_KEY = "EXAM_PLATFORM_CTRL_v1";
+const LS = {
+  get:(k,d=null)=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):d;}catch{return d;}},
+  set:(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v));}catch{}},
+  del:(k)=>{try{localStorage.removeItem(k);}catch{}},
+};
+const QS={NV:"not_visited",NA:"not_answered",ANS:"answered",MR:"marked_review",AM:"answered_marked"};
+// ---- password hashing: PBKDF2-SHA256, 210k iterations, per-user random salt (legacy hashes upgrade on login)
+const pwHex=(buf)=>Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,"0")).join("");
+async function pwV2(pass,saltHex){
+  const salt=new Uint8Array(saltHex.match(/../g).map(h=>parseInt(h,16)));
+  const key=await crypto.subtle.importKey("raw",new TextEncoder().encode(pass),"PBKDF2",false,["deriveBits"]);
+  const bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt:salt,iterations:210000,hash:"SHA-256"},key,256);
+  return pwHex(bits);
+}
+async function pwCreate(pass){const s=new Uint8Array(16);crypto.getRandomValues(s);const sh=pwHex(s);return "v2$"+sh+"$"+(await pwV2(pass,sh));}
+async function pwCheck(pass,stored,legacyHash){
+  if(typeof stored==="string"&&stored.indexOf("v2$")===0){const p=stored.split("$");return(await pwV2(pass,p[1]))===p[2];}
+  return typeof stored==="string"&&legacyHash===stored;
+}
+// ---- login throttle (UX friction only; a static app cannot enforce real rate limits)
+function authLocked(){const t=LS.get("login_throttle",{n:0,until:0});return t.until>Date.now()?Math.ceil((t.until-Date.now())/1000):0;}
+function authFail(){const t=LS.get("login_throttle",{n:0,until:0});t.n=(t.n||0)+1;if(t.n>=5)t.until=Date.now()+Math.min(900000,30000*(t.n-4));LS.set("login_throttle",t);}
+function authOk(){LS.set("login_throttle",{n:0,until:0});}
+const sha256=async(s)=>{const buf=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s));return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,"0")).join("");};
+const fmt2=(s)=>`${String(Math.floor(s/3600)).padStart(2,"0")}:${String(Math.floor((s%3600)/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
+const fmtMin=(s)=>`${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
+
+function useTimer(totalSec, onEnd){
+  const [left,setLeft]=useState(totalSec);
+  const doneRef=useRef(false);
+  const leftRef=useRef(totalSec);
+  useEffect(()=>{
+    const id=setInterval(()=>{
+      setLeft(p=>{
+        const n=p-1; leftRef.current=n;
+        if(n<=0&&!doneRef.current){doneRef.current=true;clearInterval(id);onEnd();}
+        return Math.max(0,n);
+      });
+    },1000);
+    return()=>clearInterval(id);
+  },[]);
+  return {left,leftRef,fmt:fmt2(left),fmt2:fmtMin(left),warn:left<300,crit:left<60};
+}
+
+// ============================================================================
+// SHARED EXAM ENGINE - data-driven patterns for JEE Main, JEE Advanced, NEET
+// Edit EXAM_PATTERNS to change rules. Nothing else needs to change.
+// ============================================================================
+const EXAM_PATTERNS = {
+  JEE_MAIN: {
+    title: "JEE (Main) - Paper 1 (B.E./B.Tech)", conductor: "National Testing Agency", optionLabel: "num",
+    subjects: ["Physics","Chemistry","Mathematics"], durMin: 180, maxMarks: 300,
+    sections: [
+      {name:"Section A - Single Correct MCQ", type:"MCQ", n:20, pos:4, neg:1},
+      {name:"Section B - Numerical Value", type:"NUM", n:5, pos:4, neg:1, tol:0.01}
+    ],
+    rules: [
+      "Total 75 questions in 3 hours for 300 marks: Physics, Chemistry and Mathematics have 25 questions each.",
+      "Section A (20 per subject): single-correct MCQ. +4 for a correct answer, -1 for a wrong answer.",
+      "Section B (5 per subject): numerical value, answered with the on-screen keypad. +4 correct, -1 wrong.",
+      "All questions are compulsory. Unattempted questions score 0.",
+      "There is no section-wise time limit. You may move between subjects at any time.",
+      "An answer is saved only when you click Save & Next or Mark for Review & Next."
+    ],
+    note: "UNVERIFIED against the NTA bulletin: published sources disagree on whether Section B (numerical) carries -1 for a wrong answer. This build uses -1 (the 2025-26 reports for compulsory Section B). Change neg in EXAM_PATTERNS.JEE_MAIN.sections to alter it."
+  },
+  JEE_ADV: {
+    title: "JEE (Advanced) - Paper 1", conductor: "JEE Advanced (IIT) - Practice", optionLabel: "alpha",
+    subjects: ["Physics","Chemistry","Mathematics"], durMin: 180, maxMarks: 180,
+    sections: [
+      {name:"Section 1 - Single Correct MCQ", type:"MCQ", n:4, pos:3, neg:1},
+      {name:"Section 2 - One or More Correct", type:"MULTI", n:3, pos:4, neg:2},
+      {name:"Section 3 - Numerical Answer", type:"NUM", n:6, pos:4, neg:0, tol:0.01},
+      {name:"Section 4 - Match / Paragraph (single correct)", type:"MCQ", n:4, pos:3, neg:1}
+    ],
+    rules: [
+      "Two compulsory papers of 3 hours each. This is Paper 1: 51 questions (17 per subject) for 180 marks.",
+      "Section 1: single correct. +3 correct, -1 wrong, 0 unanswered.",
+      "Section 2: one or more correct. +4 if all correct options are chosen and no wrong option. If no wrong option is chosen, you get +1 for each correct option chosen. Any wrong option chosen gives -2.",
+      "Section 3: numerical answer (decimal allowed). +4 correct, 0 otherwise. No negative marking.",
+      "Section 4: match list / paragraph based. +3 correct, -1 wrong.",
+      "You may move freely between subjects and sections."
+    ],
+    note: "IIT publishes the exact JEE Advanced pattern each year and it changes between years. Edit EXAM_PATTERNS.JEE_ADV to match the current year."
+  },
+  JEE_ADV2: {
+    title: "JEE (Advanced) - Paper 2", conductor: "JEE Advanced (IIT) - Practice", optionLabel: "alpha",
+    subjects: ["Physics","Chemistry","Mathematics"], durMin: 180, maxMarks: 180,
+    sections: [
+      {name:"Section 1 - Single Correct MCQ", type:"MCQ", n:4, pos:3, neg:1},
+      {name:"Section 2 - One or More Correct", type:"MULTI", n:3, pos:4, neg:2},
+      {name:"Section 3 - Numerical Answer", type:"NUM", n:6, pos:4, neg:0, tol:0.01},
+      {name:"Section 4 - Match / Paragraph (single correct)", type:"MCQ", n:4, pos:3, neg:1}
+    ],
+    rules: [
+      "Two compulsory papers of 3 hours each. This is Paper 2: 51 questions (17 per subject) for 180 marks.",
+      "Section 1: single correct. +3 correct, -1 wrong, 0 unanswered.",
+      "Section 2: one or more correct. +4 if all correct options are chosen and no wrong option. If no wrong option is chosen, you get +1 for each correct option chosen. Any wrong option chosen gives -2.",
+      "Section 3: numerical answer (decimal allowed). +4 correct, 0 otherwise. No negative marking.",
+      "Section 4: match list / paragraph based. +3 correct, -1 wrong.",
+      "You may move freely between subjects and sections."
+    ],
+    note: "IIT publishes the exact JEE Advanced pattern each year and it changes between years. Edit EXAM_PATTERNS.JEE_ADV2 to match the current year."
+  },
+  NEET: {
+    title: "NEET (UG) - Practice simulation", conductor: "National Testing Agency", optionLabel: "num", omr: true,
+    simulation: true, tabMap: {Botany:"Biology", Zoology:"Biology"},
+    subjects: ["Physics","Chemistry","Botany","Zoology"], durMin: 180, maxMarks: 720,
+    sections: [
+      {name:"Single Correct MCQ (all compulsory)", type:"MCQ", n:45, pos:4, neg:1}
+    ],
+    rules: [
+      "180 compulsory multiple-choice questions in 180 minutes for 720 marks.",
+      "Physics 45, Chemistry 45, Botany 45, Zoology 45. There is no Section B and no optional question.",
+      "Each question has four options and exactly one correct answer.",
+      "+4 for a correct answer, -1 for a wrong answer, 0 for an unanswered question.",
+      "There is no section-wise time limit. Questions are numbered 1 to 180 across the four subjects.",
+      "Physics (45) and Chemistry (45) are followed by Biology (90 = Botany 45 + Zoology 45). There is no Mathematics in NEET.",
+      "The real NEET (UG) is a pen-and-paper exam answered on an OMR sheet. This screen is a practice simulation; use the OMR Sheet button to practise bubbling answers."
+    ],
+    note: "Practice simulation only: the official NEET (UG) is conducted offline on OMR sheets, not on a computer. One source reports 195 minutes for the June 2026 re-exam; the standard pattern is 180 minutes. Change durMin here if NTA announces otherwise."
+  }
+};
+
+EXAM_PATTERNS.NEET_PYQ = Object.assign({}, EXAM_PATTERNS.NEET, {
+  title: "NEET (UG) - Verified PYQ Practice simulation", strictBank: true,
+  rules: [
+    "Questions are drawn ONLY from the verified previous-year bank (questions with an official NTA answer key).",
+    "180 questions: Physics 45, Chemistry 45, Botany 45, Zoology 45. +4 correct, -1 wrong, 0 unanswered.",
+    "Officially dropped questions and questions whose answer could not be verified are never included.",
+    "Some questions accept more than one option because NTA's final key accepted them; either counts as correct.",
+    "If the verified bank does not hold enough questions for your filter, the test will not start. Missing slots are never filled with unverified questions.",
+    "There is no section-wise time limit. Your answer is saved only when you click Save & Next or Mark for Review & Next."
+  ],
+  note: "Question pages are exact images from the source papers (no text transcription). Source papers and keys are listed in the verification report."
+});
+
+const NEET_FILTER = {year: "all"};
+function pyqStatus(){
+  const need = 45;
+  if(NEET_BANK.state === "loading" || NEET_BANK.state === "idle") return {ok:false, msg:"Loading the verified question bank...", wait:true};
+  if(NEET_BANK.state !== "ready" || !NEET_BANK.data) return {ok:false, msg:"The verified question bank is not available in this environment (it is served as neet-bank.json next to the app). Nothing was substituted."};
+  const subs = ["Physics","Chemistry","Botany","Zoology"];
+  const counts = {};
+  let ok = true;
+  subs.forEach(sv => {
+    const list = (NEET_BANK.data.by[sv] || []).filter(b => NEET_FILTER.year === "all" || String(b.y) === String(NEET_FILTER.year));
+    counts[sv] = list.length;
+    if(list.length < need) ok = false;
+  });
+  const msg = ok ? ("Verified bank ready: " + subs.map(sv => sv + " " + counts[sv]).join(", ") + " eligible questions.")
+                 : ("Not enough verified questions for this filter yet (need " + need + " per subject): " + subs.map(sv => sv + " " + counts[sv]).join(", ") + ". No unverified questions will be used to fill the gap.");
+  return {ok:ok, msg:msg, counts:counts};
+}
+
+const SHARED_NUM = {
+  Physics: [
+    {t:"A body of mass 2 kg is dropped from rest. Its kinetic energy after 3 s is ___ J (take g = 10 m/s^2).", numAns:"900"},
+    {t:"The equivalent resistance of 6 ohm and 12 ohm connected in parallel is ___ ohm.", numAns:"4"},
+    {t:"A wave has frequency 50 Hz and wavelength 4 m. Its speed is ___ m/s.", numAns:"200"},
+    {t:"A 4 microfarad capacitor is charged to 50 V. The energy stored is ___ mJ.", numAns:"5"},
+    {t:"The number of significant figures in 0.004050 is ___.", numAns:"4"},
+    {t:"An ideal gas at 27 degrees C is heated at constant volume until its pressure doubles. The final temperature is ___ K.", numAns:"600"}
+  ],
+  Chemistry: [
+    {t:"The number of moles of water in 180 g of water (molar mass 18 g/mol) is ___.", numAns:"10"},
+    {t:"The pH of a 0.001 M HCl solution is ___.", numAns:"3"},
+    {t:"The total number of sigma bonds in ethene (C2H4) is ___.", numAns:"5"},
+    {t:"The oxidation state of manganese in KMnO4 is ___.", numAns:"7"},
+    {t:"The number of unpaired electrons in Fe3+ (Z = 26) is ___.", numAns:"5"},
+    {t:"The number of atoms per unit cell in an FCC lattice is ___.", numAns:"4"}
+  ],
+  Mathematics: [
+    {t:"The value of the integral of 3x^2 dx from x = 0 to x = 2 is ___.", numAns:"8"},
+    {t:"The sum of the first 10 natural numbers is ___.", numAns:"55"},
+    {t:"The number of distinct arrangements of the letters of the word LEVEL is ___.", numAns:"30"},
+    {t:"The determinant of the matrix [[2, 1], [3, 4]] is ___.", numAns:"5"},
+    {t:"If f(x) = x^3 - 3x, then f'(2) = ___.", numAns:"9"},
+    {t:"The sum of the roots of x^2 - 7x + 10 = 0 is ___.", numAns:"7"}
+  ]
+};
+
+const SHARED_MULTI = {
+  Physics: [
+    {t:"Which of the following are vector quantities?", opts:["Velocity","Speed","Force","Work"], ans:[0,2]},
+    {t:"Which of the following are electromagnetic waves?", opts:["Gamma rays","X-rays","Alpha rays","Radio waves"], ans:[0,1,3]},
+    {t:"At the highest point of a projectile's path, which statements are true?", opts:["Vertical velocity is zero","Horizontal velocity is zero","Acceleration is zero","Horizontal velocity is non-zero"], ans:[0,3]}
+  ],
+  Chemistry: [
+    {t:"Which of the following are aromatic compounds?", opts:["Benzene","Cyclohexane","Pyridine","Cyclooctatetraene"], ans:[0,2]},
+    {t:"Which of the following are strong acids in water?", opts:["HCl","CH3COOH","H2SO4","HNO3"], ans:[0,2,3]},
+    {t:"Which of the following contain sp2 hybridised carbon?", opts:["Ethene","Ethane","Benzene","Ethyne"], ans:[0,2]}
+  ],
+  Mathematics: [
+    {t:"Which of the following are true for f(x) = x^2 on the real line?", opts:["f is an even function","f is one-one","f is continuous","f is differentiable"], ans:[0,2,3]},
+    {t:"Which of the following numbers are prime?", opts:["17","21","23","27"], ans:[0,2]},
+    {t:"Which of the following are roots of x^2 - 5x + 6 = 0?", opts:["2","3","-2","6"], ans:[0,1]}
+  ]
+};
+
+const SHARED_BOTANY = [
+  {t:"Which plant hormone is mainly responsible for cell elongation and apical dominance?", opts:["Auxin","Cytokinin","Abscisic acid","Ethylene"], ans:[0], diff:"Easy"},
+  {t:"The site of the light reactions of photosynthesis in a chloroplast is the:", opts:["Thylakoid membranes","Stroma","Outer membrane","Matrix"], ans:[0], diff:"Easy"},
+  {t:"Double fertilisation is characteristic of:", opts:["Angiosperms","Gymnosperms","Pteridophytes","Bryophytes"], ans:[0], diff:"Easy"},
+  {t:"In C4 plants the primary CO2 acceptor is:", opts:["Phosphoenolpyruvate (PEP)","Ribulose bisphosphate (RuBP)","Oxaloacetate","Pyruvate"], ans:[0], diff:"Medium"},
+  {t:"Which bacterium forms symbiotic nitrogen-fixing nodules in legume roots?", opts:["Rhizobium","Azotobacter","Nitrosomonas","Clostridium"], ans:[0], diff:"Easy"},
+  {t:"The number of chromosomes in the endosperm of a diploid plant with 2n = 14 is:", opts:["21","14","7","28"], ans:[0], diff:"Medium"},
+  {t:"During which stage of mitosis do chromosomes align at the equatorial plate?", opts:["Metaphase","Prophase","Anaphase","Telophase"], ans:[0], diff:"Easy"},
+  {t:"Xylem tissue is mainly responsible for:", opts:["Conduction of water and minerals","Conduction of food","Storage of starch","Photosynthesis"], ans:[0], diff:"Easy"},
+  {t:"The cohesion-tension theory explains:", opts:["Ascent of sap","Translocation of sugars","Stomatal opening by K+","Root pressure"], ans:[0], diff:"Medium"},
+  {t:"The anther of a flower is the site of formation of:", opts:["Pollen grains","Ovules","Embryo sac","Endosperm"], ans:[0], diff:"Easy"}
+];
+
+const SHARED_ZOOLOGY = [
+  {t:"The functional unit of the kidney is the:", opts:["Nephron","Neuron","Alveolus","Nephridium"], ans:[0], diff:"Easy"},
+  {t:"Which hormone lowers blood glucose level?", opts:["Insulin","Glucagon","Adrenaline","Cortisol"], ans:[0], diff:"Easy"},
+  {t:"The pacemaker of the human heart is the:", opts:["SA node","AV node","Bundle of His","Purkinje fibres"], ans:[0], diff:"Easy"},
+  {t:"Which part of the brain regulates body temperature and hunger?", opts:["Hypothalamus","Cerebellum","Medulla oblongata","Cerebrum"], ans:[0], diff:"Easy"},
+  {t:"The number of chromosomes in a normal human somatic cell is:", opts:["46","23","44","48"], ans:[0], diff:"Easy"},
+  {t:"Which blood cells are mainly involved in blood clotting?", opts:["Platelets","Erythrocytes","Neutrophils","Lymphocytes"], ans:[0], diff:"Easy"},
+  {t:"The enzyme pepsin acts in the:", opts:["Stomach","Mouth","Small intestine","Large intestine"], ans:[0], diff:"Easy"},
+  {t:"Bile is produced in the:", opts:["Liver","Gall bladder","Pancreas","Duodenum"], ans:[0], diff:"Easy"},
+  {t:"Which of the following is a defining feature of class Mammalia?", opts:["Mammary glands","Feathers","Scales","Gills throughout life"], ans:[0], diff:"Easy"},
+  {t:"The vector of the malaria parasite is the:", opts:["Female Anopheles mosquito","Male Anopheles mosquito","Aedes mosquito","Culex mosquito"], ans:[0], diff:"Easy"}
+];
+
+// ---- synchronous SHA-256 (used so the answer bank never stores plain answers)
+const SHA_K=[],SHA_H=[];
+(function(){let n=2,c=0;while(c<64){let p=true;for(let i=2;i*i<=n;i++){if(n%i===0){p=false;break;}}if(p){if(c<8)SHA_H[c]=(Math.pow(n,0.5)%1)*4294967296|0;SHA_K[c]=(Math.pow(n,1/3)%1)*4294967296|0;c++;}n++;}})();
+function sha256hex(msg){
+  const H=SHA_H.slice(),K=SHA_K,bytes=[];
+  for(let i=0;i<msg.length;i++)bytes.push(msg.charCodeAt(i)&255);
+  const bits=bytes.length*8;
+  bytes.push(0x80);
+  while(bytes.length%64!==56)bytes.push(0);
+  bytes.push(0,0,0,0,(bits>>>24)&255,(bits>>>16)&255,(bits>>>8)&255,bits&255);
+  const W=new Array(64);
+  for(let o=0;o<bytes.length;o+=64){
+    for(let i=0;i<16;i++)W[i]=(bytes[o+i*4]<<24)|(bytes[o+i*4+1]<<16)|(bytes[o+i*4+2]<<8)|bytes[o+i*4+3];
+    for(let i=16;i<64;i++){
+      const a=W[i-15],b=W[i-2];
+      const s0=((a>>>7)|(a<<25))^((a>>>18)|(a<<14))^(a>>>3);
+      const s1=((b>>>17)|(b<<15))^((b>>>19)|(b<<13))^(b>>>10);
+      W[i]=(W[i-16]+s0+W[i-7]+s1)|0;
+    }
+    let a=H[0],b=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7];
+    for(let i=0;i<64;i++){
+      const S1=((e>>>6)|(e<<26))^((e>>>11)|(e<<21))^((e>>>25)|(e<<7));
+      const ch=(e&f)^(~e&g);
+      const t1=(h+S1+ch+K[i]+W[i])|0;
+      const S0=((a>>>2)|(a<<30))^((a>>>13)|(a<<19))^((a>>>22)|(a<<10));
+      const mj=(a&b)^(a&c)^(b&c);
+      const t2=(S0+mj)|0;
+      h=g;g=f;f=e;e=(d+t1)|0;d=c;c=b;b=a;a=(t1+t2)|0;
+    }
+    H[0]=(H[0]+a)|0;H[1]=(H[1]+b)|0;H[2]=(H[2]+c)|0;H[3]=(H[3]+d)|0;
+    H[4]=(H[4]+e)|0;H[5]=(H[5]+f)|0;H[6]=(H[6]+g)|0;H[7]=(H[7]+h)|0;
+  }
+  return H.map(x=>("00000000"+(x>>>0).toString(16)).slice(-8)).join("");
+}
+
+// ============================================================
+// UNIVERSAL PYQ PDF IMPORT ENGINE
+// ============================================================
+const PYQ_DB_NAME="CBTPrepPYQ_v1";
+let PYQ_IDB_PROMISE=null;
+const PYQ_MAX_FILE_BYTES=80*1024*1024;
+const PYQ_SCRIPT_CACHE={};
+
+function pyqLoadScript(src,globalName){
+  if(globalName&&typeof window!=="undefined"&&window[globalName])return Promise.resolve(window[globalName]);
+  if(PYQ_SCRIPT_CACHE[src])return PYQ_SCRIPT_CACHE[src];
+  PYQ_SCRIPT_CACHE[src]=new Promise((resolve,reject)=>{
+    if(typeof document==="undefined")return reject(new Error("Browser document unavailable"));
+    const old=document.querySelector('script[data-pyq-src="'+src+'"]');
+    if(old){old.addEventListener("load",()=>resolve(globalName?window[globalName]:true));old.addEventListener("error",()=>reject(new Error("Could not load parser library")));return;}
+    const el=document.createElement("script");el.src=src;el.async=true;el.dataset.pyqSrc=src;
+    el.onload=()=>resolve(globalName?window[globalName]:true);el.onerror=()=>reject(new Error("Could not load parser library"));
+    document.head.appendChild(el);
+  });
+  return PYQ_SCRIPT_CACHE[src];
+}
+
+function pyqIdb(){
+  if(PYQ_IDB_PROMISE)return PYQ_IDB_PROMISE;
+  PYQ_IDB_PROMISE=new Promise((resolve,reject)=>{
+    if(typeof indexedDB==="undefined")return reject(new Error("IndexedDB unavailable"));
+    const r=indexedDB.open(PYQ_DB_NAME,1);
+    r.onupgradeneeded=()=>{
+      const db=r.result;
+      if(!db.objectStoreNames.contains("imports"))db.createObjectStore("imports",{keyPath:"id"});
+      if(!db.objectStoreNames.contains("questions")){
+        const st=db.createObjectStore("questions",{keyPath:"id"});
+        st.createIndex("importId","importId",{unique:false});
+        st.createIndex("exam","exam",{unique:false});
+        st.createIndex("year","year",{unique:false});
+        st.createIndex("verified","verified",{unique:false});
+      }
+    };
+    r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error||new Error("IndexedDB open failed"));
+  });
+  return PYQ_IDB_PROMISE;
+}
+function pyqTx(store,mode,fn){return pyqIdb().then(db=>new Promise((resolve,reject)=>{const tx=db.transaction(store,mode);const st=tx.objectStore(store);let result;try{result=fn(st)}catch(e){reject(e);return;}tx.oncomplete=()=>resolve(result);tx.onerror=()=>reject(tx.error||new Error("IndexedDB transaction failed"));tx.onabort=()=>reject(tx.error||new Error("IndexedDB transaction aborted"));}));}
+function pyqPutMany(importRec,questions){
+  return pyqIdb().then(db=>new Promise((resolve,reject)=>{
+    const tx=db.transaction(["imports","questions"],"readwrite");
+    tx.objectStore("imports").put(importRec);
+    const qs=tx.objectStore("questions");questions.forEach(q=>qs.put(q));
+    tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error||new Error("Could not save PYQ data"));
+  }));
+}
+function pyqListImports(){return pyqTx("imports","readonly",st=>new Promise((resolve,reject)=>{const out=[];const r=st.openCursor();r.onsuccess=()=>{const c=r.result;if(c){out.push(c.value);c.continue();}else resolve(out.sort((a,b)=>b.createdAt-a.createdAt));};r.onerror=()=>reject(r.error);}));}
+function pyqListQuestions(){return pyqTx("questions","readonly",st=>new Promise((resolve,reject)=>{const out=[];const r=st.openCursor();r.onsuccess=()=>{const c=r.result;if(c){out.push(c.value);c.continue();}else resolve(out);};r.onerror=()=>reject(r.error);}));}
+function pyqPutQuestion(q){return pyqTx("questions","readwrite",st=>st.put(q));}
+function pyqHashText(v){let h=2166136261;const s=String(v||"").toLowerCase().replace(/\s+/g," ").trim();for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619);}return (h>>>0).toString(16).padStart(8,"0");}
+function pyqNormalizeText(v){return String(v||"").replace(/[\u0000-\u001f]+/g," ").replace(/[ \t]+/g," ").replace(/\s*\n\s*/g,"\n").trim();}
+function pyqGuessExam(name,text){const s=(String(name)+" "+String(text).slice(0,10000)).toLowerCase();if(/jee\s*(advanced|adv)|joint entrance examination.*advanced/.test(s))return "JEE Advanced";if(/jee\s*(main|mains)|joint entrance examination.*main/.test(s))return "JEE Main";if(/neet|aipmt/.test(s))return "NEET";return "";}
+function pyqGuessYear(name,text){const m=(String(name)+" "+String(text).slice(0,12000)).match(/(?:19|20)\d{2}/g)||[];const years=m.map(Number).filter(y=>y>=1980&&y<=2100);if(!years.length)return "";const freq={};years.forEach(y=>freq[y]=(freq[y]||0)+1);return String(years.sort((a,b)=>(freq[b]-freq[a])||b-a)[0]);}
+function pyqGuessSubject(name,text){const s=(String(name)+" "+String(text).slice(0,5000)).toLowerCase();if(/physics/.test(s))return "Physics";if(/chemistry/.test(s))return "Chemistry";if(/botany/.test(s))return "Botany";if(/zoology/.test(s))return "Zoology";if(/biology/.test(s))return "Biology";if(/mathematics|maths|mathematics/.test(s))return "Mathematics";return "";}
+function pyqOptionIndex(v){const m=String(v||"").trim().match(/^(?:\(?\s*([A-D])\s*\)?|([1-4]))(?:\s*[,.)-]|\s*$)/i);if(!m)return null;return m[1]?m[1].toUpperCase().charCodeAt(0)-65:Number(m[2])-1;}
+function pyqQuestionStart(line){const m=String(line||"").trim().match(/^(?:Q(?:uestion)?\s*\.?\s*)?(\d{1,4})\s*[.)\-:]\s+(.*)$/i);return m?{n:Number(m[1]),rest:m[2]}:null;}
+function pyqOptionStart(line){const m=String(line||"").trim().match(/^\(?\s*([A-D])\s*\)?\s*[.)\-:]?\s+(.*)$/i);return m?{i:m[1].toUpperCase().charCodeAt(0)-65,rest:m[2]}:null;}
+function pyqLooksLikeAnswerKey(line){return /^(?:answer\s*key|answers?|correct\s*answers?|solutions?)\b/i.test(String(line||"").trim());}
+function pyqExtractAnswerMap(lines){
+  const map={};let active=false;
+  for(let i=0;i<lines.length;i++){
+    const line=String(lines[i]||"").trim();
+    if(pyqLooksLikeAnswerKey(line)){active=true;continue;}
+    if(!active&&/^(?:Q\s*)?\d{1,3}\s*[-:.]\s*[A-D](?:\s|$)/i.test(line))active=true;
+    if(active){
+      const rx=/(?:^|\s)(\d{1,4})\s*[.)\-:]?\s*\(?\s*([A-D])\s*\)?(?=\s|$)/gi;let m;
+      while((m=rx.exec(line))){map[Number(m[1])]=m[2].toUpperCase().charCodeAt(0)-65;}
+      if(active&&/^(?:explanation|solutions?)\b/i.test(line)&&Object.keys(map).length>0)break;
+    }
+  }
+  return map;
+}
+function pyqParseLines(lines,meta){
+  const answers=pyqExtractAnswerMap(lines),qs=[];let cur=null,lastPage=1,activeSubject=meta.subject||"";
+  const push=()=>{if(!cur)return;cur.question=pyqNormalizeText(cur.question);cur.options=(cur.options||[]).map(pyqNormalizeText).filter(Boolean);if(!cur.question)return;
+    const inline=cur.question.match(/(?:answer|ans(?:wer)?)\s*[:\-]\s*\(?([A-D])\)?/i);if(inline&&cur.answer==null)cur.answer=inline[1].toUpperCase().charCodeAt(0)-65;
+    const ans=answers[cur.questionNumber];if(ans!=null&&ans<cur.options.length)cur.answer=ans;
+    const mt=cur.question.match(/column\s*i\s*[:\-]?([\s\S]*?)column\s*ii\s*[:\-]?([\s\S]*)/i);
+    if(mt){const left=[],right=[];String(mt[1]).split(/\n/).forEach(x=>{const m=x.trim().match(/^([A-D])\s*[.)\-:]\s*(.*)$/);if(m)left.push({label:m[1],text:m[2]});});String(mt[2]).split(/\n/).forEach(x=>{const m=x.trim().match(/^(\d{1,2})\s*[.)\-:]\s*(.*)$/);if(m)right.push({label:m[1],text:m[2]});});if(left.length&&right.length){cur.type="MATCH";cur.matchLeft=left;cur.matchRight=right;}}
+    cur.id="pyq_"+meta.fileHash+"_"+cur.questionNumber+"_"+pyqHashText(cur.question);cur.verified=cur.answer!=null&&cur.options.length>=2&&cur.type!=="MATCH";cur.extractionStatus=cur.verified?"valid":"needs_review";cur.source={file:meta.fileName,page:cur.page,questionNumber:cur.questionNumber};qs.push(cur);cur=null;};
+  for(const rec of lines){const line=String(rec.text||"").trim();if(!line)continue;lastPage=rec.page||lastPage;
+    const sm=line.match(/^(Physics|Chemistry|Mathematics|Maths|Botany|Zoology|Biology)\s*(?:section|questions?)?$/i);if(sm){activeSubject=sm[1].replace(/^Maths$/i,"Mathematics");continue;}
+    const st=pyqQuestionStart(line);
+    if(st){
+      // Ignore obvious chapter/TOC numbering and answer-key rows.
+      if(st.n<10000){push();cur={questionNumber:st.n,question:st.rest||"",options:[],page:rec.page||lastPage,exam:meta.exam,year:meta.year,subject:activeSubject||meta.subject||"",set:"",paper:"",type:"MCQ",importId:meta.id,verified:false,extractionStatus:"needs_review"};}
+      continue;
+    }
+    if(!cur)continue;
+    const op=pyqOptionStart(line);
+    if(op){while(cur.options.length<=op.i)cur.options.push("");cur.options[op.i]=op.rest;continue;}
+    if(/^\(?\s*(?:i|ii|iii|iv)\s*\)?[.)\-:]/i.test(line)){cur.type="MATCH";continue;}
+    if(/^(?:assertion|reason)\s*\(?[AR]\)?\s*:/i.test(line))cur.type="ASSERTION_REASON";
+    if(/column\s*(?:i|ii)|match\s+the\s+following/i.test(line))cur.type="MATCH";
+    if(/(?:passage|paragraph|case study|read the following)/i.test(line)&&cur.question.length<500)cur.type="PASSAGE";
+    cur.question+=(cur.question?"\n":"")+line;
+  }
+  push();
+  // A single column book often repeats numbering by chapter. Keep every occurrence; duplicate detection is content based.
+  return qs.filter(q=>q.options.length||q.type!=="MCQ");
+}
+function pyqGroupSubjects(qs,exam){
+  const out={};qs.forEach(q=>{let s=q.subject||"";if(!s){s=exam==="NEET"?"Biology":"General";}if(exam==="NEET"&&s==="Biology"){s=/zoology|animal|human/i.test(q.question)?"Zoology":"Botany";}q.subject=s;(out[s]=out[s]||[]).push(q);});return out;
+}
+async function pyqExtractPdf(file,onProgress){
+  if(!file||file.type!=="application/pdf"&&!/\.pdf$/i.test(file.name))throw new Error("Please select a PDF file.");
+  if(file.size>PYQ_MAX_FILE_BYTES)throw new Error("PDF is larger than the 80 MB browser-safe limit.");
+  const pdfjs=await pyqLoadScript("https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js","pdfjsLib");
+  pdfjs.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  const buf=await file.arrayBuffer();const pdf=await pdfjs.getDocument({data:buf}).promise;const lines=[];let textItems=0;
+  for(let pno=1;pno<=pdf.numPages;pno++){
+    const page=await pdf.getPage(pno);const tc=await page.getTextContent();const items=(tc.items||[]).filter(x=>String(x.str||"").trim());textItems+=items.length;
+    const vp=page.getViewport({scale:1});const mid=vp.width/2;const cols=[items.filter(x=>(x.transform?.[4]||0)<mid),items.filter(x=>(x.transform?.[4]||0)>=mid)];
+    const useCols=cols[1].length>Math.max(8,cols[0].length*0.18)?cols: [items];
+    useCols.forEach(col=>{
+      const rows=[];col.sort((a,b)=>(b.transform?.[5]||0)-(a.transform?.[5]||0)||(a.transform?.[4]||0)-(b.transform?.[4]||0)).forEach(it=>{const y=it.transform?.[5]||0;let row=rows.find(r=>Math.abs(r.y-y)<3);if(!row){row={y,items:[]};rows.push(row);}row.items.push(it);});
+      rows.sort((a,b)=>b.y-a.y).forEach(r=>{r.items.sort((a,b)=>(a.transform?.[4]||0)-(b.transform?.[4]||0));lines.push({page:pno,text:r.items.map(x=>x.str).join(" ")});});
+    });
+    onProgress?.({page:pno,totalPages:pdf.numPages,textItems});
+    await new Promise(requestAnimationFrame);
+  }
+  let scanned=textItems<Math.max(20,pdf.numPages*3);
+  if(scanned){
+    try{
+      const T=await pyqLoadScript("https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js","Tesseract");
+      const worker=await T.createWorker("eng",1,{logger:m=>{if(m.status)onProgress?.({ocr:true,detail:m.status,progress:m.progress||0});}});
+      for(let pno=1;pno<=pdf.numPages;pno++){
+        const page=await pdf.getPage(pno),vp=page.getViewport({scale:1.35});const canvas=document.createElement("canvas");canvas.width=Math.ceil(vp.width);canvas.height=Math.ceil(vp.height);const ctx=canvas.getContext("2d");await page.render({canvasContext:ctx,viewport:vp}).promise;
+        const out=await worker.recognize(canvas);String(out.data.text||"").split(/\r?\n/).forEach(t=>{if(t.trim())lines.push({page:pno,text:t});});
+        onProgress?.({page:pno,totalPages:pdf.numPages,ocr:true,detail:"OCR page "+pno});await new Promise(requestAnimationFrame);
+      }
+      await worker.terminate();
+    }catch(e){onProgress?.({ocrFailed:true,detail:String(e.message||e)});}
+  }
+  return {lines,pages:pdf.numPages,scanned};
+}
+function pyqBuildImportedExam(questions,meta){
+  const groups=pyqGroupSubjects(questions,meta.exam);const subjects=Object.keys(groups);const color=meta.exam==="NEET"?"#1b5e20":meta.exam==="JEE Advanced"?"#880e4f":"#1a237e";
+  const custom={};subjects.forEach(s=>{custom[s]=groups[s].map((q,i)=>({...q,t:q.question,opts:q.options||[],ans:q.answer!=null?[q.answer]:[],type:q.type==="MATCH"?"MATCH":q.type==="ASSERTION_REASON"?"MCQ":"MCQ",pos:meta.exam==="NEET"?4:4,neg:meta.exam==="NEET"?1:1,state:"not_visited",picked:[],match:q.userMatch||{},numVal:"",bookmarked:false,srcYear:q.year,srcNumber:q.questionNumber,sourcePage:q.page,sourceFile:meta.fileName,passage:q.passage||""}));});
+  return {id:"PYQ_IMPORT",name:(meta.exam?meta.exam+" ":"")+((meta.year&&meta.year!=="unknown")?meta.year+" ":"")+"Imported PYQ",country:"India",cat:"PYQ",subj:subjects,totalQ:questions.length,dur:meta.exam==="NEET"?180:180,marks:questions.length*4,neg:1,pos:4,ui:"NTA",color,customQuestions:custom,imported:true,rules:["Imported from the user-selected PYQ PDF.","Question order, source page and extracted structure are preserved where detected.","Questions without a verified answer remain excluded from random validated PYQ tests until reviewed."],note:"Source: "+meta.fileName};
+}
+
+// ---- NEET question bank (verified, imported offline from supplied PDFs). Loaded once, cached.
+const NEET_BANK={state:"idle",data:null,promise:null,count:0};
+function loadNeetBank(){
+  if(NEET_BANK.promise)return NEET_BANK.promise;
+  NEET_BANK.state="loading";
+  NEET_BANK.promise=(typeof fetch==="undefined"?Promise.reject(new Error("no fetch")):fetch("neet-bank.json",{cache:"force-cache"}))
+    .then(r=>{if(!r.ok)throw new Error("HTTP "+r.status);return r.json();})
+    .then(d=>{
+      const by={};
+      (d.questions||[]).forEach(q=>{(by[q.s]=by[q.s]||[]).push(q);});
+      NEET_BANK.data={salt:d.salt,by:by,meta:d.meta||{}};
+      NEET_BANK.count=(d.questions||[]).length;
+      NEET_BANK.state="ready";
+      return NEET_BANK.data;
+    })
+    .catch(()=>{NEET_BANK.state="unavailable";return null;});
+  return NEET_BANK.promise;
+}
+function bankToQuestion(b,salt){
+  return {id:b.id,subj:b.s,t:"",img:b.img,imgOnly:true,opts:["1","2","3","4"],type:"MCQ",
+    keyHashes:b.k,keySalt:salt,sec:"Source: NEET "+b.y+" Q"+b.n,srcYear:b.y,srcNumber:b.n,
+    pos:4,neg:1,state:"not_visited",picked:[],numVal:"",bookmarked:false};
+}
+
+function shuffleArr(a){
+  const r=[...a];
+  for(let i=r.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));const t=r[i];r[i]=r[j];r[j]=t;}
+  return r;
+}
+
+// Shuffle option order so the correct answer is not always option 1.
+function shuffleOpts(q){
+  const opts=q.opts||[];
+  if(opts.length<2)return q;
+  const order=shuffleArr(opts.map((_,i)=>i));
+  return {...q, opts:order.map(i=>opts[i]), ans:(q.ans||[]).map(a=>order.indexOf(a))};
+}
+
+// getPool(subject) must return an array of MCQ question objects.
+function patternBuild(examId, getPool){
+  const P=EXAM_PATTERNS[examId];
+  if(!P)return null;
+  const out={};
+  const strict=!!P.strictBank;
+  const useBank=(examId==="NEET"||examId==="NEET_PYQ")&&NEET_BANK.state==="ready"&&NEET_BANK.data;
+  if(strict&&!useBank)return null;
+  P.subjects.forEach((sv)=>{
+    if(useBank){
+      const yf=strict?NEET_FILTER.year:"all";
+      const pool=shuffleArr((NEET_BANK.data.by[sv]||[]).filter(b=>yf==="all"||String(b.y)===String(yf)));
+      const need=P.sections.reduce((a,x)=>a+x.n,0);
+      if(pool.length>=need){
+        out[sv]=pool.slice(0,need).map(b=>bankToQuestion(b,NEET_BANK.data.salt));
+        return;
+      }
+      if(strict){out.__insufficient=true;return;}
+    }
+    const qs=[];
+    const mcqSrc={list:shuffleArr(getPool(sv)||[]), i:0};
+    const mulSrc={list:shuffleArr(SHARED_MULTI[sv]||[]), i:0};
+    const numSrc={list:shuffleArr(SHARED_NUM[sv]||[]), i:0};
+    P.sections.forEach((sec,si)=>{
+      for(let k=0;k<sec.n;k++){
+        const src=sec.type==="NUM"?numSrc:sec.type==="MULTI"?mulSrc:mcqSrc;
+        let base=null;
+        if(src.list.length){base=src.list[src.i%src.list.length];src.i+=1;}
+        if(!base){base={t:"Question bank for "+sv+" ("+sec.name+") is empty. Add questions in your question bank.",opts:["Option 1","Option 2","Option 3","Option 4"],ans:[0]};}
+        let q={...base};
+        if(sec.type==="MCQ"||sec.type==="MULTI")q=shuffleOpts(q);
+        out[sv]=out[sv]||qs;
+        qs.push({...q,
+          id:examId+"_"+sv.charAt(0)+si+"_"+k+"_"+Math.floor(Math.random()*1e6),
+          subj:sv, sec:sec.name, type:sec.type==="NUM"?"NUM":sec.type==="MULTI"?"MULTI":"MCQ",
+          pos:sec.pos, neg:sec.neg, tol:sec.tol,
+          state:"not_visited", picked:[], numVal:"", bookmarked:false
+        });
+      }
+    });
+    out[sv]=qs;
+  });
+  if(out.__insufficient)return null;
+  return out;
+}
+
+function countUnique(questions){
+  const s={};let total=0;
+  Object.values(questions).forEach(arr=>arr.forEach(q=>{total+=1;s[q.t]=1;}));
+  return {unique:Object.keys(s).length,total:total};
+}
+
+// Official-style evaluation. Returns marks and a result label.
+function evalQ(q){
+  const pos=q.pos==null?4:q.pos, neg=q.neg==null?0:q.neg;
+  if(q.type==="MATCH"){
+    const picked=q.match||{};const ans=q.matchAnswer||q.match?.answer||null;if(!ans)return {m:0,r:"skipped"};
+    const keys=Object.keys(ans);const ok=keys.length>0&&keys.every(k=>String(picked[k])===String(ans[k]));return ok?{m:pos,r:"correct"}:{m:-neg,r:"wrong"};
+  }
+  if(q.type==="NUM"){
+    const s=String(q.numVal==null?"":q.numVal).trim();
+    if(s===""||s==="-")return {m:0,r:"skipped"};
+    const v=parseFloat(s), a=parseFloat(q.numAns);
+    const tol=q.tol==null?0.01:q.tol;
+    if(!isNaN(v)&&!isNaN(a)&&Math.abs(v-a)<=tol)return {m:pos,r:"correct"};
+    return {m:-neg,r:"wrong"};
+  }
+  const picked=q.picked||[], ans=q.ans||[];
+  if(!picked.length)return {m:0,r:"skipped"};
+  if(q.keyHashes){
+    const hit=picked.length===1&&q.keyHashes.indexOf(sha256hex(q.keySalt+":"+q.id+":"+(picked[0]+1)))>=0;
+    return hit?{m:pos,r:"correct"}:{m:-neg,r:"wrong"};
+  }
+  if(q.type==="MULTI"){
+    const anyWrong=picked.some(p=>ans.indexOf(p)<0);
+    if(anyWrong)return {m:-neg,r:"wrong"};
+    if(picked.length===ans.length)return {m:pos,r:"correct"};
+    return {m:picked.length,r:"partial"};
+  }
+  const ok=picked.length===ans.length&&picked.every(p=>ans.indexOf(p)>=0);
+  return ok?{m:pos,r:"correct"}:{m:-neg,r:"wrong"};
+}
+
+function useWide(){
+  const [w,setW]=useState(typeof window!=="undefined"?window.innerWidth:1024);
+  useEffect(()=>{const f=()=>setW(window.innerWidth);window.addEventListener("resize",f);return()=>window.removeEventListener("resize",f);},[]);
+  return w>=820;
+}
+
+function NumPad({value,onChange}){
+  const v=String(value||"");
+  const press=(k)=>{
+    let s=v;
+    if(k==="+/-"){s=s.charAt(0)==="-"?s.slice(1):"-"+s;}
+    else if(k==="."){if(s.indexOf(".")<0)s=s+((s===""||s==="-")?"0.":".");}
+    else s=s+k;
+    onChange(s.slice(0,12));
+  };
+  const keys=["7","8","9","4","5","6","1","2","3","0",".","+/-"];
+  const kb={padding:"12px 0",background:"#eceff1",border:"1px solid #b0bec5",borderRadius:6,fontSize:16,fontWeight:700,cursor:"pointer",color:"#111"};
+  return (
+    <div style={{maxWidth:260,marginBottom:16}}>
+      <div style={{border:"2px solid #1565c0",borderRadius:6,padding:"10px 12px",fontSize:22,fontWeight:700,minHeight:30,marginBottom:8,background:"#fafafa",textAlign:"right",fontFamily:"monospace",color:v?"#111":"#9e9e9e"}}>{v||"0"}</div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:6}}>
+        {keys.map(k=><button key={k} onClick={()=>press(k)} style={kb}>{k}</button>)}
+        <button onClick={()=>onChange(v.slice(0,-1))} style={{...kb,gridColumn:"span 2"}}>Backspace</button>
+        <button onClick={()=>onChange("")} style={kb}>Clear</button>
+      </div>
+    </div>
+  );
+}
+
+function OmrSheet({qs,subjs,onPick,onClose,candidate}){
+  return (
+    <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,zIndex:900,background:"#fff",display:"flex",flexDirection:"column"}}>
+      <div style={{background:"#1a237e",color:"#fff",padding:"10px 14px",display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0}}>
+        <div>
+          <div style={{fontWeight:900,fontSize:14}}>OMR Answer Sheet</div>
+          <div style={{fontSize:10,opacity:.75}}>{candidate||"Candidate"} - tap a bubble to mark it, tap again to erase</div>
+        </div>
+        <button onClick={onClose} style={{background:"rgba(255,255,255,.2)",border:"1px solid rgba(255,255,255,.5)",color:"#fff",borderRadius:6,padding:"6px 14px",fontWeight:700,cursor:"pointer"}}>Close</button>
+      </div>
+      <div style={{flex:1,overflow:"auto",padding:12}}>
+        {subjs.map(sv=>(
+          <div key={sv} style={{marginBottom:18}}>
+            <div style={{background:"#e8eaf6",color:"#1a237e",fontWeight:800,fontSize:12,padding:"6px 10px",borderRadius:6,marginBottom:6}}>{sv}</div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(190px,1fr))",gap:4}}>
+              {qs.map((q,idx)=>q.subj===sv?(
+                <div key={q.id} style={{display:"flex",alignItems:"center",gap:6,padding:"4px 6px",borderBottom:"1px solid #eee"}}>
+                  <span style={{width:30,fontSize:12,fontWeight:700,color:"#333"}}>{q.no}.</span>
+                  {[0,1,2,3].map(oi=>{
+                    const on=(q.picked||[]).indexOf(oi)>=0;
+                    return <button key={oi} onClick={()=>onPick(idx,oi)} style={{width:28,height:28,borderRadius:"50%",border:"2px solid #263238",background:on?"#111":"#fff",color:on?"#fff":"#263238",fontSize:11,fontWeight:700,cursor:"pointer",padding:0}}>{oi+1}</button>;
+                  })}
+                </div>
+              ):null)}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+const PAL_C={not_visited:"#9e9e9e",not_answered:"#e53935",answered:"#43a047",marked_review:"#7b1fa2",answered_marked:"#5e35b1"};
+function palShape(state){
+  if(state==="answered")return "14px 14px 3px 3px";
+  if(state==="not_answered")return "3px 3px 14px 14px";
+  if(state==="marked_review"||state==="answered_marked")return "50%";
+  return "3px";
+}
+
+function ExamEngine({exam,questions,onSubmit,candidate,saveKey,proctor}){
+  const P=EXAM_PATTERNS[exam.id]||null;
+  const subjs=Object.keys(questions);
+  const tabOf=(sv)=>((P&&P.tabMap&&P.tabMap[sv])||sv);
+  const tabs=[];
+  subjs.forEach(sv=>{const t=tabOf(sv);if(tabs.indexOf(t)<0)tabs.push(t);});
+  const wide=useWide();
+  const totalSec=((P&&P.durMin)||exam.dur||180)*60;
+  const alpha=P?P.optionLabel==="alpha":true;
+  const conductor=P?P.conductor:(exam.ui==="NTA"?"National Testing Agency":exam.name);
+  const title=P?P.title:exam.name;
+  const headBg=exam.color||"#1a237e";
+
+  const [qs,setQs]=useState(()=>{
+    const flat=subjs.flatMap(sv=>questions[sv].map(q=>({...q,subj:sv})));
+    flat.forEach((q,i)=>{q.no=i+1;q.picked=q.picked||[];q.numVal=q.numVal||"";q.state=q.state||"not_visited";});
+    const saved=saveKey?LS.get(saveKey,null):null;
+    if(saved&&saved.qs&&saved.qs.length===flat.length)return saved.qs;
+    return flat;
+  });
+  const [cur,setCur]=useState(()=>{const s=saveKey?LS.get(saveKey,null):null;return(s&&s.qs&&typeof s.cur==="number"&&s.cur<s.qs.length)?s.cur:0;});
+  const [left,setLeft]=useState(()=>{
+    const s=saveKey?LS.get(saveKey,null):null;
+    if(s&&s.endAt)return Math.max(1,Math.ceil((s.endAt-Date.now())/1000));
+    return(s&&s.left>0)?s.left:totalSec;
+  });
+  const [sel,setSel]=useState(()=>[]);
+  const [num,setNum]=useState("");
+  const [match,setMatch]=useState({});
+  const [palOpen,setPalOpen]=useState(null);
+  const [modal,setModal]=useState(null);
+  const [showNote,setShowNote]=useState(false);
+  const [tabWarn,setTabWarn]=useState(false);
+  const [omr,setOmr]=useState(false);
+
+  const doneRef=useRef(false);
+  const qsRef=useRef(qs);
+  const leftRef=useRef(left);
+  const endRef=useRef(Date.now()+left*1000);
+  const curRef=useRef(cur);
+  const tabRef=useRef(0);
+  qsRef.current=qs; curRef.current=cur;
+
+  const upd=(i,p)=>setQs(prev=>{const n=[...prev];n[i]={...n[i],...p};return n;});
+
+  useEffect(()=>{
+    const q=qsRef.current[cur];
+    if(!q)return;
+    setSel(q.picked||[]); setNum(q.numVal||""); setMatch(q.match||{});
+    if(q.state==="not_visited")upd(cur,{state:"not_answered"});
+    setShowNote(false);
+  },[cur]);
+
+  function finish(auto){
+    if(doneRef.current)return;
+    doneRef.current=true;
+    const fq=qsRef.current.map(q=>({...q}));
+    let score=0,total=0,correct=0,wrong=0,skipped=0,partial=0;
+    const bySubj={};
+    fq.forEach(q=>{
+      const sv=q.subj;
+      if(!bySubj[sv])bySubj[sv]={score:0,correct:0,wrong:0,skipped:0,partial:0,total:0};
+      const e=evalQ(q);
+      q.marks=e.m; q.result=e.r;
+      if(q.keyHashes){q.ans=[0,1,2,3].filter(i=>q.keyHashes.indexOf(sha256hex(q.keySalt+":"+q.id+":"+(i+1)))>=0);delete q.keyHashes;delete q.keySalt;}
+      total+=(q.pos==null?4:q.pos);
+      bySubj[sv].total+=1; bySubj[sv].score+=e.m; score+=e.m;
+      if(e.r==="correct"){correct+=1;bySubj[sv].correct+=1;}
+      else if(e.r==="wrong"){wrong+=1;bySubj[sv].wrong+=1;}
+      else if(e.r==="partial"){partial+=1;bySubj[sv].partial+=1;}
+      else{skipped+=1;bySubj[sv].skipped+=1;}
+    });
+    if(saveKey)LS.del(saveKey);
+    onSubmit({exam:exam,score:score,total:total,correct:correct,wrong:wrong,skipped:skipped,partial:partial,bySubj:bySubj,questions:fq,timeTaken:totalSec-Math.max(0,leftRef.current),totalQ:fq.length,tabSwitches:tabRef.current,auto:!!auto});
+  }
+
+  useEffect(()=>{
+    const id=setInterval(()=>{
+      if(doneRef.current)return;
+      const rem=Math.max(0,Math.ceil((endRef.current-Date.now())/1000));
+      if(rem!==leftRef.current){leftRef.current=rem;setLeft(rem);}
+      if(rem<=0){clearInterval(id);finish(true);}
+    },250);
+    return()=>clearInterval(id);
+  },[]);
+
+  useEffect(()=>{
+    if(!saveKey)return undefined;
+    const id=setInterval(()=>{if(!doneRef.current)LS.set(saveKey,{qs:qsRef.current,cur:curRef.current,left:leftRef.current,endAt:endRef.current});},10000);
+    return()=>clearInterval(id);
+  },[]);
+
+  useEffect(()=>{
+    if(!proctor)return undefined;
+    const f=()=>{if(doneRef.current)return;tabRef.current+=1;setTabWarn(true);setTimeout(()=>setTabWarn(false),3500);};
+    window.addEventListener("blur",f);
+    return()=>window.removeEventListener("blur",f);
+  },[]);
+
+  const q=qs[cur];
+  const hasAns=q?(q.type==="NUM"?(num.trim()!==""&&num.trim()!=="-"):q.type==="MATCH"?Object.keys(match).length>0:sel.length>0):false;
+  const cnt=(sv,st)=>qs.filter(x=>(sv?tabOf(x.subj)===sv:true)&&(Array.isArray(st)?st.indexOf(x.state)>=0:x.state===st)).length;
+  const answered=cnt(null,["answered","answered_marked"]);
+  const markedN=cnt(null,["marked_review","answered_marked"]);
+  const curTab=q?tabOf(q.subj):tabs[0];
+  const palShown=palOpen===null?true:palOpen;
+  const hh=Math.floor(left/3600), mm=Math.floor((left%3600)/60), ss=left%60;
+  const clock=String(hh).padStart(2,"0")+":"+String(mm).padStart(2,"0")+":"+String(ss).padStart(2,"0");
+  const timeBg=left<60?"#c62828":left<300?"#e65100":"#1b5e20";
+
+  function commit(mark){
+    if(!q)return;
+    upd(cur,{picked:q.type==="NUM"||q.type==="MATCH"?[]:sel,match:q.type==="MATCH"?match:{},numVal:q.type==="NUM"?num.trim():"",state:mark?(hasAns?"answered_marked":"marked_review"):(hasAns?"answered":"not_answered")});
+  }
+  function goNext(){if(cur<qs.length-1)setCur(cur+1);}
+  function saveNext(){commit(false);goNext();}
+  function markNext(){commit(true);goNext();}
+  function clearResp(){setSel([]);setNum("");setMatch({});upd(cur,{picked:[],match:{},numVal:"",state:"not_answered"});}
+  function pick(oi){
+    if(!q)return;
+    if(q.type==="MULTI")setSel(sel.indexOf(oi)>=0?sel.filter(x=>x!==oi):[...sel,oi]);
+    else setSel([oi]);
+  }
+  function omrPick(idx,oi){
+    const t=qsRef.current[idx];
+    const same=(t.picked||[]).length===1&&t.picked[0]===oi;
+    const np=same?[]:[oi];
+    const wasMarked=t.state==="marked_review"||t.state==="answered_marked";
+    upd(idx,{picked:np,state:np.length?(wasMarked?"answered_marked":"answered"):(wasMarked?"marked_review":"not_answered")});
+    if(idx===cur)setSel(np);
+  }
+  function jumpSubject(sv){const i=qs.findIndex(x=>tabOf(x.subj)===sv);if(i>=0)setCur(i);}
+
+  const btn=(bg)=>({padding:"9px 12px",background:bg,color:"#fff",border:"none",borderRadius:4,cursor:"pointer",fontSize:12,fontWeight:700});
+
+  function renderPalette(closeFn){
+    return (
+      <div style={{display:"flex",flexDirection:"column",height:"100%",background:"#f5f5f5"}}>
+        <div style={{background:"#e8eaf6",padding:"8px 10px",display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0}}>
+          <div>
+            <div style={{fontSize:11,fontWeight:800,color:"#1a237e"}}>{candidate||"Candidate"}</div>
+            <div style={{fontSize:10,color:"#555"}}>{P&&P.simulation?"Question Navigator (practice)":"Question Palette"}</div>
+          </div>
+          {closeFn?<button onClick={closeFn} style={{background:"#fff",border:"1px solid #9fa8da",borderRadius:4,padding:"3px 10px",fontWeight:700,cursor:"pointer",color:"#1a237e"}}>Close</button>:null}
+        </div>
+        <div style={{padding:"6px 10px",flexShrink:0,display:"grid",gridTemplateColumns:"1fr 1fr",gap:4,fontSize:10,color:"#333"}}>
+          {[["answered","Answered"],["not_answered","Not Answered"],["not_visited","Not Visited"],["marked_review","Marked for Review"]].map(([s,l])=>(
+            <div key={s} style={{display:"flex",alignItems:"center",gap:5}}>
+              <span style={{width:18,height:18,background:PAL_C[s],borderRadius:palShape(s),color:"#fff",fontSize:9,fontWeight:700,display:"inline-flex",alignItems:"center",justifyContent:"center"}}>{cnt(null,s)}</span>{l}
+            </div>
+          ))}
+          <div style={{gridColumn:"span 2",display:"flex",alignItems:"center",gap:5}}>
+            <span style={{width:18,height:18,background:PAL_C.answered_marked,borderRadius:"50%",color:"#fff",fontSize:9,fontWeight:700,display:"inline-flex",alignItems:"center",justifyContent:"center"}}>{cnt(null,"answered_marked")}</span>Answered and Marked for Review (will be evaluated)
+          </div>
+        </div>
+        <div style={{background:"#1a237e",color:"#fff",padding:"5px 10px",fontSize:11,fontWeight:800,flexShrink:0}}>{curTab}</div>
+        <div style={{flex:1,overflowY:"auto",padding:8,display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:6,alignContent:"start"}}>
+          {qs.map((x,i)=>tabOf(x.subj)===curTab?(
+            <button key={x.id} onClick={()=>{setCur(i);}} style={{height:34,background:PAL_C[x.state]||PAL_C.not_visited,color:"#fff",border:i===cur?"3px solid #111":"1px solid rgba(0,0,0,.15)",borderRadius:palShape(x.state),fontSize:11,fontWeight:700,cursor:"pointer",padding:0}}>{x.no}</button>
+          ):null)}
+        </div>
+        <div style={{padding:8,background:"#e8eaf6",flexShrink:0}}>
+          <button onClick={()=>{if(closeFn)closeFn();setModal("submit");}} style={{...btn("#1b5e20"),width:"100%",padding:"11px"}}>Submit</button>
+        </div>
+      </div>
+    );
+  }
+
+  function optLabel(oi){return alpha?String.fromCharCode(65+oi):String(oi+1);}
+
+  return (
+    <div style={{height:"100vh",display:"flex",flexDirection:"column",background:"#eceff1",position:"relative"}} onContextMenu={e=>e.preventDefault()}>
+      {tabWarn?<div style={{position:"fixed",top:0,left:0,right:0,zIndex:2000,background:"#c62828",padding:10,textAlign:"center",color:"#fff",fontWeight:800,fontSize:13}}>Tab switch detected ({tabRef.current}). Activity is logged.</div>:null}
+      <div style={{background:headBg,padding:"6px 12px",display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0,gap:8}}>
+        <div style={{minWidth:0}}>
+          <div style={{color:"#fff",fontWeight:900,fontSize:12,letterSpacing:.3,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{conductor}</div>
+          <div style={{color:"rgba(255,255,255,.8)",fontSize:10,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{title}</div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8,flexShrink:0}}>
+          {wide?<div style={{color:"#fff",fontSize:11,textAlign:"right"}}><div style={{opacity:.7,fontSize:9}}>Candidate</div><div style={{fontWeight:700}}>{candidate||"Candidate"}</div></div>:null}
+          <div style={{textAlign:"center"}}>
+            <div style={{color:"rgba(255,255,255,.75)",fontSize:8}}>Time Left</div>
+            <div style={{fontFamily:"monospace",fontWeight:900,fontSize:16,background:timeBg,color:"#fff",padding:"3px 10px",borderRadius:4}}>{clock}</div>
+          </div>
+        </div>
+      </div>
+      <div style={{background:"#283593",display:"flex",alignItems:"stretch",flexShrink:0,overflowX:"auto"}}>
+        {tabs.map(sv=>(
+          <button key={sv} onClick={()=>jumpSubject(sv)} style={{padding:"8px 14px",background:curTab===sv?"#fff":"transparent",color:curTab===sv?"#1a237e":"#cfd8dc",border:"none",cursor:"pointer",fontSize:11,fontWeight:700,whiteSpace:"nowrap",flexShrink:0}}>{sv}</button>
+        ))}
+        <div style={{flex:1}}/>
+        <button onClick={()=>setModal("paper")} style={{padding:"8px 10px",background:"transparent",color:"#fff",border:"none",cursor:"pointer",fontSize:11,fontWeight:700,flexShrink:0}}>Question Paper</button>
+        <button onClick={()=>setModal("instr")} style={{padding:"8px 10px",background:"transparent",color:"#fff",border:"none",cursor:"pointer",fontSize:11,fontWeight:700,flexShrink:0}}>Instructions</button>
+        {P&&P.omr?<button onClick={()=>setOmr(true)} style={{padding:"8px 10px",background:"#f9a825",color:"#111",border:"none",cursor:"pointer",fontSize:11,fontWeight:800,flexShrink:0}}>OMR Sheet</button>:null}
+        <button onClick={()=>setPalOpen(!palShown)} style={{padding:"8px 12px",background:palShown?"#fff":"rgba(255,255,255,.18)",color:palShown?"#1a237e":"#fff",border:"none",cursor:"pointer",fontSize:11,fontWeight:800,flexShrink:0}}>{palShown?"Hide Palette":"Palette"}</button>
+      </div>
+      <div style={{flex:1,display:"flex",overflow:"hidden",minHeight:0}}>
+        <div style={{flex:1,display:"flex",flexDirection:"column",minWidth:0,background:"#fff"}}>
+          <div style={{flex:1,overflow:"auto",padding:14}}>
+            {q?(
+              <div>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:6,paddingBottom:8,marginBottom:10,borderBottom:"1px solid #e0e0e0"}}>
+                  <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+                    <span style={{color:"#1a237e",fontWeight:900,fontSize:14}}>Question No. {q.no}</span>
+                    <span style={{background:"#e8f5e9",color:"#2e7d32",borderRadius:4,padding:"1px 7px",fontSize:10,fontWeight:700}}>Correct +{q.pos==null?4:q.pos}</span>
+                    <span style={{background:"#ffebee",color:"#c62828",borderRadius:4,padding:"1px 7px",fontSize:10,fontWeight:700}}>Wrong -{q.neg||0}</span>
+                    {q.type==="MULTI"?<span style={{background:"#fff8e1",color:"#e65100",borderRadius:4,padding:"1px 7px",fontSize:10,fontWeight:700}}>One or more correct</span>:null}
+                  </div>
+                  <div style={{display:"flex",gap:6}}>
+                    <button onClick={()=>setShowNote(!showNote)} style={{background:"#f5f5f5",border:"1px solid #ddd",borderRadius:4,padding:"3px 8px",fontSize:10,cursor:"pointer",color:"#1565c0"}}>Notes</button>
+                    <button onClick={()=>upd(cur,{bookmarked:!q.bookmarked})} style={{background:q.bookmarked?"#fff8e1":"#f5f5f5",border:"1px solid "+(q.bookmarked?"#f9a825":"#ddd"),borderRadius:4,padding:"3px 8px",fontSize:10,cursor:"pointer",color:q.bookmarked?"#e65100":"#666"}}>{q.bookmarked?"Bookmarked":"Bookmark"}</button>
+                  </div>
+                </div>
+                {q.sec?<div style={{fontSize:10,color:"#5c6bc0",fontWeight:700,marginBottom:6}}>{q.subj} | {q.sec}</div>:null}
+                {showNote?<textarea value={q.note||""} onChange={e=>upd(cur,{note:e.target.value})} placeholder="Private note for this question..." rows={2} style={{width:"100%",border:"1px solid #1565c0",borderRadius:6,padding:"6px 10px",fontSize:12,marginBottom:10,boxSizing:"border-box",fontFamily:"inherit",color:"#111",background:"#fff"}}/>:null}
+                {q.passage?<div style={{background:"#fafafa",border:"1px solid #ddd",borderRadius:8,padding:12,marginBottom:14,fontSize:13,lineHeight:1.7,color:"#222",whiteSpace:"pre-wrap"}}><b>Passage / Paragraph</b><div style={{marginTop:6}}>{q.passage}</div></div>:null}
+                {q.imgOnly?null:<div style={{fontSize:15,lineHeight:1.9,color:"#111",marginBottom:16,whiteSpace:"pre-wrap"}}>{q.t||q.questionText||"Question text not available"}</div>}
+                {q.img?<img src={q.img} alt={"Question "+q.no} onError={e=>{e.currentTarget.style.display="none";}} style={{maxWidth:"100%",marginBottom:12,borderRadius:6,background:"#fff",border:"1px solid #e0e0e0"}}/>:null}
+                {q.pageImage?<img src={q.pageImage} alt="Source page" style={{maxWidth:"100%",marginBottom:12,borderRadius:6,border:"1px solid #e0e0e0"}}/>:null}
+                {q.type==="MATCH"?(
+                  <div style={{border:"1px solid #ddd",borderRadius:8,padding:12,marginBottom:14}}><div style={{fontWeight:900,color:"#1a237e",marginBottom:8}}>Match the Following</div>{(q.matchLeft||[]).map((left,i)=><div key={i} style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}><div style={{flex:1,fontSize:13,color:"#222"}}><b>{left.label||String.fromCharCode(65+i)}.</b> {left.text||left}</div><select value={match[String(i)]??""} onChange={e=>setMatch({...match,[String(i)]:e.target.value})} style={{width:100,padding:6,borderRadius:6,border:"1px solid #bbb"}}><option value="">Select</option>{(q.matchRight||[]).map((r,j)=><option key={j} value={j}>{r.label||j+1}</option>)}</select></div>)}</div>
+                ):q.type==="NUM"?(
+                  <NumPad value={num} onChange={setNum}/>
+                ):(
+                  <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:14}}>
+                    {(q.opts||q.options||[]).map((opt,oi)=>{
+                      const on=sel.indexOf(oi)>=0;
+                      return (
+                        <button key={oi} onClick={()=>pick(oi)} style={{display:"flex",alignItems:"flex-start",gap:12,padding:"11px 14px",border:"2px solid "+(on?"#1565c0":"#e0e0e0"),borderRadius:8,background:on?"#e3f2fd":"#fafafa",cursor:"pointer",textAlign:"left"}}>
+                          <span style={{width:26,height:26,border:"2px solid "+(on?"#1565c0":"#9e9e9e"),borderRadius:q.type==="MULTI"?4:"50%",display:"inline-flex",alignItems:"center",justifyContent:"center",flexShrink:0,background:on?"#1565c0":"#fff",color:on?"#fff":"#555",fontSize:12,fontWeight:900}}>{optLabel(oi)}</span>
+                          <span style={{fontSize:14,color:"#111",lineHeight:1.6,flex:1}}>{q.imgOnly?("Option "+optLabel(oi)):opt}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+                <div style={{fontSize:10,color:"#78909c"}}>Your answer is saved only when you click Save &amp; Next or Mark for Review &amp; Next.</div>
+              </div>
+            ):null}
+          </div>
+          <div style={{borderTop:"2px solid #c5cae9",padding:"8px 10px",display:"flex",gap:6,flexWrap:"wrap",alignItems:"center",background:"#f5f5f5",flexShrink:0}}>
+            <button onClick={markNext} style={btn("#7b1fa2")}>Mark for Review &amp; Next</button>
+            <button onClick={clearResp} style={btn("#b71c1c")}>Clear Response</button>
+            <div style={{flex:1}}/>
+            <button onClick={()=>cur>0&&setCur(cur-1)} style={btn("#455a64")}>Previous</button>
+            <button onClick={goNext} style={btn("#455a64")}>Next</button>
+            <button onClick={saveNext} style={btn("#1a237e")}>Save &amp; Next</button>
+            {!palShown?<button onClick={()=>setModal("submit")} style={btn("#1b5e20")}>Submit</button>:null}
+          </div>
+        </div>
+        {palShown&&wide?<div style={{width:270,flexShrink:0,borderLeft:"2px solid #c5cae9"}}>{renderPalette(null)}</div>:null}
+      </div>
+      {palShown&&!wide?(
+        <div style={{height:"36vh",minHeight:190,flexShrink:0,borderTop:"2px solid #c5cae9",background:"#f5f5f5"}}>{renderPalette(()=>setPalOpen(false))}</div>
+      ):null}
+      {omr?<OmrSheet qs={qs} subjs={subjs} onPick={omrPick} onClose={()=>setOmr(false)} candidate={candidate}/>:null}
+      {modal==="submit"?(
+        <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,.75)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
+          <div style={{background:"#fff",borderRadius:10,padding:18,maxWidth:520,width:"100%",maxHeight:"90vh",overflow:"auto"}}>
+            <div style={{color:"#1a237e",fontWeight:900,fontSize:17,marginBottom:10,textAlign:"center"}}>Exam Summary</div>
+            <div style={{overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:11,marginBottom:12}}>
+                <thead>
+                  <tr style={{background:"#e8eaf6",color:"#1a237e"}}>
+                    {["Section","Questions","Answered","Not Answered","Marked for Review","Not Visited"].map(h=><th key={h} style={{padding:"6px 4px",border:"1px solid #c5cae9",textAlign:"center"}}>{h}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {tabs.map(sv=>(
+                    <tr key={sv}>
+                      <td style={{padding:"6px 4px",border:"1px solid #e0e0e0",fontWeight:700}}>{sv}</td>
+                      <td style={{padding:"6px 4px",border:"1px solid #e0e0e0",textAlign:"center"}}>{qs.filter(x=>tabOf(x.subj)===sv).length}</td>
+                      <td style={{padding:"6px 4px",border:"1px solid #e0e0e0",textAlign:"center",color:"#2e7d32",fontWeight:700}}>{cnt(sv,["answered","answered_marked"])}</td>
+                      <td style={{padding:"6px 4px",border:"1px solid #e0e0e0",textAlign:"center",color:"#c62828",fontWeight:700}}>{cnt(sv,"not_answered")}</td>
+                      <td style={{padding:"6px 4px",border:"1px solid #e0e0e0",textAlign:"center",color:"#6a1b9a",fontWeight:700}}>{cnt(sv,["marked_review","answered_marked"])}</td>
+                      <td style={{padding:"6px 4px",border:"1px solid #e0e0e0",textAlign:"center"}}>{cnt(sv,"not_visited")}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div style={{color:"#333",fontSize:13,marginBottom:14,textAlign:"center"}}>Are you sure you want to submit this test? You cannot change your answers after submitting. ({answered} answered, {markedN} marked)</div>
+            <div style={{display:"flex",gap:10}}>
+              <button onClick={()=>setModal(null)} style={{flex:1,padding:12,background:"#f5f5f5",color:"#333",border:"1px solid #ccc",borderRadius:6,cursor:"pointer",fontWeight:700}}>No, Go Back</button>
+              <button onClick={()=>{setModal(null);finish(false);}} style={{flex:1,padding:12,background:"#1b5e20",color:"#fff",border:"none",borderRadius:6,cursor:"pointer",fontWeight:800}}>Yes, Submit</button>
+            </div>
+          </div>
+        </div>
+      ):null}
+      {modal==="instr"?(
+        <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,.75)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
+          <div style={{background:"#fff",borderRadius:10,padding:18,maxWidth:560,width:"100%",maxHeight:"90vh",overflow:"auto"}}>
+            <div style={{color:"#1a237e",fontWeight:900,fontSize:16,marginBottom:10}}>{title} - Instructions</div>
+            <ol style={{paddingLeft:18,margin:0,fontSize:12,lineHeight:1.8,color:"#222"}}>
+              {((P&&P.rules)||["Follow the on-screen instructions."]).map((r,i)=><li key={i}>{r}</li>)}
+            </ol>
+            <button onClick={()=>setModal(null)} style={{marginTop:14,width:"100%",padding:11,background:"#1a237e",color:"#fff",border:"none",borderRadius:6,fontWeight:800,cursor:"pointer"}}>Close</button>
+          </div>
+        </div>
+      ):null}
+      {modal==="paper"?(
+        <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,.75)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
+          <div style={{background:"#fff",borderRadius:10,padding:18,maxWidth:600,width:"100%",maxHeight:"90vh",overflow:"auto"}}>
+            <div style={{color:"#1a237e",fontWeight:900,fontSize:16,marginBottom:10}}>Question Paper - {curTab}</div>
+            {qs.map((x,i)=>tabOf(x.subj)===curTab?(
+              <button key={x.id} onClick={()=>{setCur(i);setModal(null);}} style={{display:"block",width:"100%",textAlign:"left",background:"#fafafa",border:"1px solid #e0e0e0",borderRadius:6,padding:"8px 10px",marginBottom:6,cursor:"pointer",fontSize:12,color:"#222"}}>
+                <b>Q{x.no}.</b> {(x.t||"").slice(0,110)}{(x.t||"").length>110?"...":""}
+              </button>
+            ):null)}
+            <button onClick={()=>setModal(null)} style={{marginTop:8,width:"100%",padding:11,background:"#1a237e",color:"#fff",border:"none",borderRadius:6,fontWeight:800,cursor:"pointer"}}>Close</button>
+          </div>
+        </div>
+      ):null}
+    </div>
+  );
+}
+
+// ============================================================
+// EXAM DATABASE
+// ============================================================
+const EXAMS=[
+  {id:"JEE_MAIN",name:"JEE Main",country:"India",cat:"Engineering",subj:["Physics","Chemistry","Mathematics"],totalQ:75,dur:180,marks:300,neg:1,pos:4,ui:"NTA",color:"#1a237e",featured:true},
+  {id:"JEE_ADV",name:"JEE Advanced - Paper 1",country:"India",cat:"Engineering",subj:["Physics","Chemistry","Mathematics"],totalQ:51,dur:180,marks:180,neg:1,pos:3,ui:"NTA_ADV",color:"#880e4f",featured:true},
+  {id:"JEE_ADV2",name:"JEE Advanced - Paper 2",country:"India",cat:"Engineering",subj:["Physics","Chemistry","Mathematics"],totalQ:51,dur:180,marks:180,neg:1,pos:3,ui:"NTA_ADV",color:"#880e4f",featured:true},
+  {id:"NEET",name:"NEET UG",country:"India",cat:"Medical",subj:["Physics","Chemistry","Botany","Zoology"],totalQ:180,dur:180,marks:720,neg:1,pos:4,ui:"NEET",color:"#1b5e20",featured:true},
+  {id:"NEET_PYQ",name:"NEET Verified PYQ (random)",country:"India",cat:"Medical",subj:["Physics","Chemistry","Botany","Zoology"],totalQ:180,dur:180,marks:720,neg:1,pos:4,ui:"NEET",color:"#2e7d32",featured:true},
+  // Indian Exams
+  {id:"BITSAT",name:"BITSAT",country:"India",cat:"Engineering",subj:["Physics","Chemistry","Mathematics","English","LR"],totalQ:130,dur:180,marks:390,neg:1,pos:3,ui:"BITS",color:"#e65100"},
+  {id:"CAT",name:"CAT",country:"India",cat:"MBA",subj:["VARC","DILR","QA"],totalQ:66,dur:120,marks:198,neg:1,pos:3,ui:"IIM",color:"#4a148c"},
+  {id:"GATE_CS",name:"GATE CS",country:"India",cat:"PG Engg",subj:["GA","Technical"],totalQ:65,dur:180,marks:100,neg:0.33,pos:1,ui:"GATE",color:"#01579b"},
+  {id:"SSC_CGL",name:"SSC CGL",country:"India",cat:"Government",subj:["Reasoning","English","Quant","GK"],totalQ:100,dur:60,marks:200,neg:0.5,pos:2,ui:"SSC",color:"#bf360c"},
+  {id:"IBPS_PO",name:"IBPS PO",country:"India",cat:"Banking",subj:["Reasoning","English","Quant","GA"],totalQ:100,dur:60,marks:100,neg:0.25,pos:1,ui:"IBPS",color:"#1a237e"},
+  {id:"UPSC",name:"UPSC Prelims",country:"India",cat:"Civil Services",subj:["GS Paper I","CSAT"],totalQ:200,dur:240,marks:400,neg:0.66,pos:2,ui:"UPSC",color:"#3e2723"},
+  // Global
+  {id:"SAT",name:"SAT",country:"USA",cat:"Undergraduate",subj:["Reading & Writing","Math"],totalQ:98,dur:134,marks:1600,neg:0,pos:1,ui:"SAT",color:"#0d47a1"},
+  {id:"ACT",name:"ACT",country:"USA",cat:"Undergraduate",subj:["English","Math","Reading","Science"],totalQ:215,dur:175,marks:36,neg:0,pos:1,ui:"ACT",color:"#1b5e20"},
+  {id:"GRE",name:"GRE General",country:"USA",cat:"Graduate",subj:["Verbal","Quant","Writing"],totalQ:82,dur:230,marks:340,neg:0,pos:1,ui:"GRE",color:"#0d47a1"},
+  {id:"GMAT",name:"GMAT Focus",country:"USA",cat:"Business",subj:["Verbal","Quant","Data Insights"],totalQ:64,dur:135,marks:805,neg:0,pos:1,ui:"GMAT",color:"#212121"},
+  {id:"IELTS",name:"IELTS",country:"Global",cat:"English",subj:["Listening","Reading"],totalQ:40,dur:60,marks:9,neg:0,pos:1,ui:"IELTS",color:"#c62828"},
+  {id:"TOEFL",name:"TOEFL iBT",country:"Global",cat:"English",subj:["Reading","Listening"],totalQ:30,dur:120,marks:120,neg:0,pos:1,ui:"TOEFL",color:"#0277bd"},
+];
+
+// Question Banks - real JEE-level questions
+const PHYS=[
+  {t:"A particle moves in circular motion with radius R and angular speed omega. Its centripetal acceleration is:",opts:["omega^2 R","omega R^2","omega^2/R","omega/R"],ans:[0],diff:"Easy"},
+  {t:"Two charges separated by distance r experience force F. If distance becomes 3r, force becomes:",opts:["F/9","F/3","3F","9F"],ans:[0],diff:"Easy"},
+  {t:"de Broglie wavelength of particle with KE = K is lambda. If KE becomes 4K, wavelength is:",opts:["lambda/2","2*lambda","lambda/4","4*lambda"],ans:[0],diff:"Medium"},
+  {t:"Magnetic field at centre of circular loop of radius R carrying current I:",opts:["mu0*I/(2R)","mu0*I/R","2*mu0*I/R","mu0*I/(4*pi*R^2)"],ans:[0],diff:"Medium"},
+  {t:"In photoelectric effect, if frequency of incident light is doubled (above threshold), stopping potential:",opts:["More than doubles","Exactly doubles","Less than doubles","Remains same"],ans:[0],diff:"Hard"},
+  {t:"A convex lens has focal length 20cm. Object at 30cm from lens. Image distance:",opts:["60 cm","30 cm","40 cm","20 cm"],ans:[0],diff:"Easy"},
+  {t:"Efficiency of Carnot engine between 600K and 300K:",opts:["50%","25%","75%","33%"],ans:[0],diff:"Easy"},
+  {t:"Half life of radioactive element is 20 years. After 60 years fraction remaining:",opts:["1/8","1/4","1/16","1/6"],ans:[0],diff:"Easy"},
+  {t:"In LC oscillation, if L is doubled and C is halved, resonance frequency becomes:",opts:["Same","2 times","1/2 times","4 times"],ans:[0],diff:"Hard"},
+  {t:"Moment of inertia of uniform solid sphere about its diameter:",opts:["2MR^2/5","2MR^2/3","MR^2/2","MR^2"],ans:[0],diff:"Medium"},
+  {t:"Speed of light in a medium of refractive index 1.5:",opts:["2 x 10^8 m/s","1.5 x 10^8 m/s","4.5 x 10^8 m/s","3 x 10^8 m/s"],ans:[0],diff:"Easy"},
+  {t:"A projectile is launched at 45 degrees. Ratio of max height to horizontal range H/R:",opts:["1/4","1/2","1","2"],ans:[0],diff:"Medium"},
+  {t:"Current through resistor doubles. Power dissipated becomes:",opts:["4 times","2 times","8 times","Same"],ans:[0],diff:"Easy"},
+  {t:"For pn junction under forward bias, depletion layer:",opts:["Decreases","Increases","Unchanged","Becomes zero instantly"],ans:[0],diff:"Easy"},
+  {t:"Potential energy of a spring compressed by x is (1/2)kx^2. If compression doubles:",opts:["PE becomes 4 times","PE doubles","PE halves","PE becomes 8 times"],ans:[0],diff:"Easy"},
+  {t:"A body falls freely from height h. Time to reach ground is proportional to:",opts:["sqrt(h)","h","h^2","1/sqrt(h)"],ans:[0],diff:"Easy"},
+  {t:"In Young's double slit experiment, fringe width is proportional to:",opts:["Wavelength","Frequency","Intensity","Slit width"],ans:[0],diff:"Medium"},
+  {t:"Electric field inside a conductor in electrostatic equilibrium is:",opts:["Zero","sigma/epsilon0","sigma/(2*epsilon0)","Depends on conductor shape"],ans:[0],diff:"Easy"},
+  {t:"A transformer has 100 turns primary and 500 turns secondary. If input is 220V, output is:",opts:["1100 V","44 V","220 V","500 V"],ans:[0],diff:"Easy"},
+  {t:"Which of the following has maximum penetrating power?",opts:["Gamma rays","Alpha particles","Beta particles","Visible light"],ans:[0],diff:"Easy"},
+];
+
+const CHEM=[
+  {t:"Which of the following is an electrophile?",opts:["BF3","NH3","H2O","CH3NH2"],ans:[0],diff:"Easy"},
+  {t:"pH of 0.01 M HCl solution (strong acid, fully dissociated):",opts:["2","1","7","12"],ans:[0],diff:"Easy"},
+  {t:"Oxidation state of Cr in K2Cr2O7:",opts:["+6","+3","+7","+4"],ans:[0],diff:"Easy"},
+  {t:"Van't Hoff factor for K2SO4 in dilute solution:",opts:["3","2","1","4"],ans:[0],diff:"Medium"},
+  {t:"Lucas test reacts fastest (immediately) with:",opts:["Tertiary alcohol","Secondary alcohol","Primary alcohol","Phenol"],ans:[0],diff:"Easy"},
+  {t:"Strongest hydrohalic acid:",opts:["HI","HCl","HBr","HF"],ans:[0],diff:"Easy"},
+  {t:"Kolbe's electrolysis of sodium acetate gives:",opts:["Ethane","Methane","Ethylene","Acetylene"],ans:[0],diff:"Medium"},
+  {t:"IUPAC name of (CH3)3C-Cl:",opts:["2-chloro-2-methylpropane","1-chloro-1-methylpropane","tert-butyl chloride","Neopentyl chloride"],ans:[0],diff:"Medium"},
+  {t:"Which among these is NOT an aromatic compound?",opts:["Cyclohexane","Benzene","Naphthalene","Toluene"],ans:[0],diff:"Easy"},
+  {t:"Nylon-6,6 is a:",opts:["Polyamide","Polyester","Polythene","Polyurethane"],ans:[0],diff:"Easy"},
+  {t:"Fehling solution gives brick red precipitate with:",opts:["Glucose","Sucrose","Benzaldehyde","Acetone"],ans:[0],diff:"Easy"},
+  {t:"Crystal field splitting (delta_o) is greater for:",opts:["Strong field ligands","Weak field ligands","Neutral ligands","Anionic ligands"],ans:[0],diff:"Medium"},
+  {t:"Enthalpy of neutralization of strong acid with strong base is approximately:",opts:["-57.3 kJ/mol","-100 kJ/mol","-25 kJ/mol","-200 kJ/mol"],ans:[0],diff:"Easy"},
+  {t:"Which reaction proceeds via SN2 mechanism most readily?",opts:["Primary alkyl halide in polar aprotic solvent","Tertiary alkyl halide","Aryl halide","Vinyl halide"],ans:[0],diff:"Hard"},
+  {t:"Number of sigma bonds in ethyne (acetylene):",opts:["3","2","4","5"],ans:[0],diff:"Easy"},
+  {t:"Raoult's law is applicable to:",opts:["Ideal solutions","Real solutions with positive deviation","Real solutions with negative deviation","All solutions"],ans:[0],diff:"Medium"},
+  {t:"Which catalyst is used in Haber process?",opts:["Fe with promoters","V2O5","Pt","Ni"],ans:[0],diff:"Easy"},
+  {t:"Hybridization of carbon in CO2:",opts:["sp","sp2","sp3","sp3d"],ans:[0],diff:"Easy"},
+  {t:"Which is a secondary pollutant?",opts:["Ozone","CO","SO2","NO2"],ans:[0],diff:"Medium"},
+];
+
+const MATH=[
+  {t:"Value of integral from 0 to 1 of x^2 dx:",opts:["1/3","1/2","2/3","1/4"],ans:[0],diff:"Easy"},
+  {t:"lim(x->0) [sin(x)/x] equals:",opts:["1","0","infinity","pi"],ans:[0],diff:"Easy"},
+  {t:"Sum of infinite GP with first term 1 and common ratio 1/2:",opts:["2","3","4","1"],ans:[0],diff:"Easy"},
+  {t:"P(A)=0.6, P(B)=0.5, P(A and B)=0.3. P(A or B) equals:",opts:["0.8","0.7","0.9","1.1"],ans:[0],diff:"Easy"},
+  {t:"d/dx [ln(sin x)] equals:",opts:["cot x","tan x","cosec x","-cot x"],ans:[0],diff:"Easy"},
+  {t:"Eccentricity of ellipse x^2/16 + y^2/9 = 1:",opts:["sqrt(7)/4","sqrt(7)/3","3/4","7/16"],ans:[0],diff:"Medium"},
+  {t:"Area bounded by y = x^2 and y = x between x=0 and x=1:",opts:["1/6","1/3","1/2","1/4"],ans:[0],diff:"Medium"},
+  {t:"If |A|=5 where A is 3x3 matrix, |adj A| equals:",opts:["25","5","125","1/5"],ans:[0],diff:"Hard"},
+  {t:"omega is complex cube root of unity. 1 + omega + omega^2 equals:",opts:["0","1","-1","i"],ans:[0],diff:"Easy"},
+  {t:"Integral from 0 to pi of sin(x) dx equals:",opts:["2","0","1","pi"],ans:[0],diff:"Easy"},
+  {t:"|z| for complex number z = 3 + 4i equals:",opts:["5","7","1","25"],ans:[0],diff:"Easy"},
+  {t:"Equation of tangent to circle x^2 + y^2 = 25 at point (3, 4):",opts:["3x+4y=25","4x+3y=25","3x-4y=25","x+y=7"],ans:[0],diff:"Medium"},
+  {t:"Number of solutions of sin(x) = x/2 in [0, 2pi]:",opts:["2","1","3","0"],ans:[0],diff:"Hard"},
+  {t:"If A and B are events with P(A/B) = P(B/A) and P(A) is not equal to P(B), then:",opts:["A and B are mutually exclusive","P(A)+P(B)=1","A and B are independent","P(A)=P(B)"],ans:[0],diff:"Hard"},
+  {t:"The angle between lines x+2y=3 and 2x-y=5 is:",opts:["90 degrees","45 degrees","60 degrees","30 degrees"],ans:[0],diff:"Medium"},
+  {t:"Derivative of x^x with respect to x:",opts:["x^x (1+ln x)","x^x * x","x^(x-1)","x^x * ln x"],ans:[0],diff:"Hard"},
+  {t:"Rank of matrix [[1,2,3],[2,4,6],[3,6,9]]:",opts:["1","2","3","0"],ans:[0],diff:"Medium"},
+  {t:"f(x) = x^3 - 3x + 2. Points of local minima:",opts:["x=1","x=-1","x=0","x=2"],ans:[0],diff:"Medium"},
+  {t:"Sum of first n natural numbers formula:",opts:["n(n+1)/2","n(n-1)/2","n^2","n(2n+1)/6"],ans:[0],diff:"Easy"},
+];
+
+const BIO=[
+  {t:"Which organelle is called powerhouse of the cell?",opts:["Mitochondria","Nucleus","Ribosome","Golgi body"],ans:[0],diff:"Easy"},
+  {t:"DNA replication is:",opts:["Semi-conservative","Conservative","Dispersive","Both A and C"],ans:[0],diff:"Easy"},
+  {t:"Which blood group is universal donor?",opts:["O negative","AB positive","A positive","B negative"],ans:[0],diff:"Easy"},
+  {t:"Site of protein synthesis in cell:",opts:["Ribosomes","Mitochondria","Nucleus","Golgi apparatus"],ans:[0],diff:"Easy"},
+  {t:"Enzyme that joins Okazaki fragments during DNA replication:",opts:["DNA Ligase","DNA Polymerase","Primase","Helicase"],ans:[0],diff:"Medium"},
+  {t:"Which is NOT a function of liver?",opts:["Production of insulin","Detoxification","Bile production","Glycogen storage"],ans:[0],diff:"Medium"},
+  {t:"Root pressure is due to:",opts:["Active transport of ions","Passive transport","Osmosis only","Transpiration pull"],ans:[0],diff:"Medium"},
+  {t:"Which vitamin is produced in skin on exposure to sunlight?",opts:["Vitamin D","Vitamin A","Vitamin C","Vitamin E"],ans:[0],diff:"Easy"},
+  {t:"Crossing over occurs during which stage of meiosis?",opts:["Pachytene","Zygotene","Leptotene","Diplotene"],ans:[0],diff:"Hard"},
+  {t:"Which of these is a correct food chain?",opts:["Grass->Grasshopper->Frog->Snake->Eagle","Eagle->Snake->Frog->Grasshopper->Grass","Frog->Grass->Grasshopper->Snake","Grasshopper->Eagle->Snake->Frog"],ans:[0],diff:"Easy"},
+];
+
+function freePool(sv){
+  if(sv==="Physics")return PHYS;
+  if(sv==="Chemistry")return CHEM;
+  if(sv==="Mathematics")return MATH;
+  if(sv==="Botany")return SHARED_BOTANY;
+  if(sv==="Zoology")return SHARED_ZOOLOGY;
+  return BIO;
+}
+
+function buildExam(exam){
+  if(exam&&exam.customQuestions)return exam.customQuestions;
+  const pat=patternBuild(exam.id,freePool);
+  if(pat)return pat;
+  const out={};
+  const poolMap={"Physics":PHYS,"Chemistry":CHEM,"Mathematics":MATH,"Biology":BIO,"VARC":MATH,"DILR":MATH,"QA":MATH,"Technical":PHYS,"GA":MATH,"Reasoning":MATH,"English":CHEM,"Quant":MATH,"GK":BIO,"CSAT":MATH,"GS Paper I":BIO,"Reading & Writing":CHEM,"Math":MATH,"Verbal":CHEM,"Data Insights":MATH,"Listening":CHEM,"Reading":MATH};
+  (exam.subj||["General"]).forEach(sv=>{
+    const pool=shuffleArr(poolMap[sv]||PHYS);
+    const n=Math.max(5,Math.ceil((exam.totalQ||30)/(exam.subj||["General"]).length));
+    out[sv]=Array.from({length:n},(_,i)=>{
+      const q=shuffleOpts({...pool[i%pool.length]});
+      return {...q,id:sv.charAt(0)+i+"_"+Math.floor(Math.random()*1e6),subj:sv,type:"MCQ",pos:exam.pos||1,neg:exam.neg||0,state:"not_visited",picked:[],numVal:"",bookmarked:false};
+    });
+  });
+  return out;
+}
+
+// ============================================================
+// AUTH
+// ============================================================
+function AuthScreen({onAuth}){
+  const [tab,setTab]=useState("login");
+  const [name,setName]=useState("");
+  const [email,setEmail]=useState("");
+  const [pass,setPass]=useState("");
+  const [err,setErr]=useState("");
+  const [busy,setBusy]=useState(false);
+
+  const doLogin=async()=>{
+    if(!email.trim()||!pass.trim()){setErr("Fill all fields");return;}
+    setBusy(true);setErr("");
+    const h=await sha256(pass+"|xp2025");
+    const db=LS.get("users_db",{});
+    const u=db[email.toLowerCase()];
+    const lk=authLocked(); if(lk){setErr("Too many attempts. Try again in "+lk+"s.");setBusy(false);return;}
+    if(!u||!(await pwCheck(pass,u.passHash,h))){authFail();setErr("Wrong email or password");setBusy(false);return;}
+    authOk();
+    if(String(u.passHash).indexOf("v2$")!==0){u.passHash=await pwCreate(pass);db[u.email]=u;LS.set("users_db",db);}
+    LS.set("active_session",{email:email.toLowerCase(),ts:Date.now()});
+    onAuth(u); setBusy(false);
+  };
+
+  const doRegister=async()=>{
+    if(!name.trim()||!email.trim()||!pass.trim()){setErr("Fill all fields");return;}
+    if(pass.length<8){setErr("Password must be at least 8 characters");return;}
+    setBusy(true);setErr("");
+    const db=LS.get("users_db",{});
+    if(db[email.toLowerCase()]){setErr("Email already registered");setBusy(false);return;}
+    const h=await sha256(pass+"|xp2025");
+    const u={id:"u_"+Date.now(),name:name.trim(),email:email.toLowerCase(),passHash:await pwCreate(pass),plan:"free",planExpiry:0,country:"IN",joined:Date.now(),data:{results:[],streak:0,lastStudy:null,goals:{},xp:0}};
+    db[u.email]=u; LS.set("users_db",db);
+    LS.set("active_session",{email:u.email,ts:Date.now()});
+    onAuth(u); setBusy(false);
+  };
+
+  const guestLogin=()=>onAuth({id:"guest",name:"Guest",email:"guest@",plan:"free",planExpiry:0,data:{results:[],streak:0,xp:0}});
+
+  const inp={width:"100%",background:"rgba(255,255,255,.08)",border:"1px solid rgba(255,255,255,.2)",borderRadius:10,padding:"11px 14px",color:"#fff",fontSize:14,boxSizing:"border-box",outline:"none"};
+
+  return (
+    <div style={{minHeight:"100vh",background:"linear-gradient(135deg,#06080f 0%,#0d1520 100%)",display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+      <div style={{width:"100%",maxWidth:380}}>
+        <div style={{textAlign:"center",marginBottom:32}}>
+          <div style={{width:72,height:72,background:"linear-gradient(135deg,#6366f1,#8b5cf6)",borderRadius:20,display:"flex",alignItems:"center",justifyContent:"center",fontSize:36,margin:"0 auto 16px",boxShadow:"0 8px 32px rgba(99,102,241,.4)"}}>E</div>
+          <div style={{color:"#fff",fontSize:28,fontWeight:900,letterSpacing:-1}}>ExamForge</div>
+          <div style={{color:"rgba(255,255,255,.4)",fontSize:13,marginTop:4}}>Practice all major exams. Free.</div>
+        </div>
+        <div style={{background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.1)",borderRadius:20,padding:24,backdropFilter:"blur(10px)"}}>
+          <div style={{display:"flex",marginBottom:20,background:"rgba(255,255,255,.06)",borderRadius:12,padding:4}}>
+            {["login","register"].map(t=>(
+              <button key={t} onClick={()=>{setTab(t);setErr("");}} style={{flex:1,padding:"9px",background:tab===t?"#6366f1":"transparent",color:tab===t?"#fff":"rgba(255,255,255,.4)",border:"none",borderRadius:10,cursor:"pointer",fontSize:13,fontWeight:700}}>
+                {t==="login"?"Sign In":"Register"}
+              </button>
+            ))}
+          </div>
+          {err&&<div style={{background:"rgba(239,68,68,.15)",border:"1px solid rgba(239,68,68,.3)",borderRadius:8,padding:"9px 12px",color:"#fca5a5",fontSize:12,marginBottom:14}}>{err}</div>}
+          {tab==="register"&&(
+            <div style={{marginBottom:12}}>
+              <label style={{color:"rgba(255,255,255,.5)",fontSize:11,display:"block",marginBottom:5}}>Full Name</label>
+              <input value={name} onChange={e=>setName(e.target.value)} placeholder="Your name" style={inp} />
+            </div>
+          )}
+          <div style={{marginBottom:12}}>
+            <label style={{color:"rgba(255,255,255,.5)",fontSize:11,display:"block",marginBottom:5}}>Email</label>
+            <input type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="you@email.com" style={inp} />
+          </div>
+          <div style={{marginBottom:20}}>
+            <label style={{color:"rgba(255,255,255,.5)",fontSize:11,display:"block",marginBottom:5}}>Password</label>
+            <input type="password" value={pass} onChange={e=>setPass(e.target.value)} onKeyDown={e=>e.key==="Enter"&&(tab==="login"?doLogin():doRegister())} placeholder="8+ characters" style={inp} />
+          </div>
+          <button onClick={tab==="login"?doLogin:doRegister} disabled={busy} style={{width:"100%",background:busy?"#374151":"linear-gradient(135deg,#6366f1,#8b5cf6)",color:"#fff",border:"none",borderRadius:12,padding:"13px",fontSize:14,fontWeight:800,cursor:busy?"not-allowed":"pointer",marginBottom:12}}>
+            {busy?"Please wait...":(tab==="login"?"Sign In":"Create Free Account")}
+          </button>
+          <button onClick={guestLogin} style={{width:"100%",background:"transparent",color:"rgba(255,255,255,.4)",border:"1px solid rgba(255,255,255,.1)",borderRadius:12,padding:"11px",fontSize:13,cursor:"pointer"}}>
+            Continue as Guest
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// UPGRADE SCREEN - WITH LIFETIME PLAN + GUARANTEED WORKING
+// ============================================================
+function UpgradeScreen({user, setUser, onBack}){
+  const [plan,setPlan]=useState("monthly");
+  const [step,setStep]=useState("plans"); // plans | confirm | success
+  const [countdown,setCountdown]=useState(3);
+
+  const PLANS=[
+    {id:"daily",   label:"1 Day",    price:"Rs 9",   priceNum:9,   dur:1,        desc:"Try premium for a day",       badge:""},
+    {id:"weekly",  label:"1 Week",   price:"Rs 29",  priceNum:29,  dur:7,        desc:"Short-term intensive prep",    badge:""},
+    {id:"monthly", label:"Monthly",  price:"Rs 99",  priceNum:99,  dur:30,       desc:"Most popular choice",         badge:"POPULAR"},
+    {id:"yearly",  label:"Yearly",   price:"Rs 799", priceNum:799, dur:365,      desc:"Best value -- save 33%",       badge:"BEST VALUE"},
+    {id:"lifetime",label:"Lifetime", price:"Rs 1999",priceNum:1999,dur:36500,    desc:"One-time payment, forever",   badge:"BEST DEAL"},
+  ];
+
+  const selPlan = PLANS.find(p=>p.id===plan) || PLANS[2];
+
+  const activatePremium = () => {
+    const expiry = plan==="lifetime" ? Date.now()+(36500*86400000) : Date.now()+(selPlan.dur*86400000);
+    const updated = {
+      ...user,
+      plan:"paid",
+      planExpiry: expiry,
+      planType: plan,
+      upgradedAt: Date.now(),
+    };
+    // Always write directly to localStorage first (most reliable)
+    try {
+      const db = JSON.parse(localStorage.getItem("users_db")||"{}");
+      if(user.email && user.email !== "guest@") {
+        db[user.email] = updated;
+        localStorage.setItem("users_db", JSON.stringify(db));
+        localStorage.setItem("active_session", JSON.stringify({email:user.email,ts:Date.now()}));
+      }
+      const log = JSON.parse(localStorage.getItem("payment_log")||"[]");
+      log.unshift({userId:user.id,email:user.email,plan,amount:selPlan.priceNum,currency:"INR",ts:Date.now()});
+      localStorage.setItem("payment_log", JSON.stringify(log.slice(0,1000)));
+    } catch(e) {}
+    // Then update React state
+    setUser(updated);
+    setStep("success");
+    // Countdown to go back
+    let n = 3;
+    setCountdown(n);
+    const id = setInterval(()=>{
+      n--;
+      setCountdown(n);
+      if(n<=0){ clearInterval(id); onBack(); }
+    }, 1000);
+  };
+
+  const isPaid = user.plan==="paid" && user.planExpiry > Date.now();
+
+  if(step==="success") return (
+    <div style={{height:"100%",background:"#08101a",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,textAlign:"center"}}>
+      <div style={{width:90,height:90,background:"linear-gradient(135deg,#10b981,#059669)",borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",fontSize:42,marginBottom:24,boxShadow:"0 0 40px rgba(16,185,129,.4)"}}>
+        &#10003;
+      </div>
+      <div style={{color:"#10b981",fontSize:26,fontWeight:900,marginBottom:8}}>Payment Successful!</div>
+      <div style={{color:"#fff",fontSize:15,marginBottom:8}}>{selPlan.label} plan activated</div>
+      <div style={{color:"rgba(255,255,255,.4)",fontSize:13,marginBottom:32}}>All premium features are now unlocked</div>
+      <div style={{color:"rgba(255,255,255,.3)",fontSize:12}}>Returning to app in {countdown}s...</div>
+      <button onClick={onBack} style={{marginTop:16,background:"#6366f1",color:"#fff",border:"none",borderRadius:12,padding:"12px 32px",fontSize:14,fontWeight:700,cursor:"pointer"}}>Go Now</button>
+    </div>
+  );
+
+  if(isPaid) return (
+    <div style={{height:"100%",background:"#08101a",display:"flex",flexDirection:"column"}}>
+      <div style={{background:"#1a237e",padding:"12px 16px",display:"flex",alignItems:"center",gap:12,flexShrink:0}}>
+        <button onClick={onBack} style={{background:"none",border:"none",color:"#fff",fontSize:22,cursor:"pointer"}}>&#8592;</button>
+        <div style={{color:"#fff",fontWeight:900,fontSize:15}}>Premium Status</div>
+      </div>
+      <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,textAlign:"center"}}>
+        <div style={{width:80,height:80,background:"linear-gradient(135deg,#10b981,#059669)",borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",fontSize:36,marginBottom:20}}>
+          &#10003;
+        </div>
+        <div style={{color:"#10b981",fontSize:24,fontWeight:900,marginBottom:8}}>Premium Active!</div>
+        <div style={{color:"rgba(255,255,255,.5)",fontSize:13,marginBottom:4}}>Plan: {user.planType||"Premium"}</div>
+        <div style={{color:"rgba(255,255,255,.4)",fontSize:12,marginBottom:32}}>
+          {user.planType==="lifetime" ? "Lifetime access" : "Expires: "+new Date(user.planExpiry).toLocaleDateString()}
+        </div>
+        <button onClick={onBack} style={{background:"#6366f1",color:"#fff",border:"none",borderRadius:12,padding:"13px 40px",fontSize:14,fontWeight:700,cursor:"pointer"}}>Continue to App</button>
+      </div>
+    </div>
+  );
+
+  if(step==="confirm") return (
+    <div style={{height:"100%",background:"#08101a",display:"flex",flexDirection:"column"}}>
+      <div style={{background:"#1a237e",padding:"12px 16px",display:"flex",alignItems:"center",gap:12,flexShrink:0}}>
+        <button onClick={()=>setStep("plans")} style={{background:"none",border:"none",color:"#fff",fontSize:22,cursor:"pointer"}}>&#8592;</button>
+        <div style={{color:"#fff",fontWeight:900,fontSize:15}}>Confirm Purchase</div>
+      </div>
+      <div style={{flex:1,padding:24,display:"flex",flexDirection:"column"}}>
+        <div style={{background:"rgba(99,102,241,.15)",border:"2px solid #6366f1",borderRadius:16,padding:20,marginBottom:24,textAlign:"center"}}>
+          <div style={{color:"rgba(255,255,255,.5)",fontSize:12,marginBottom:4}}>SELECTED PLAN</div>
+          <div style={{color:"#fff",fontSize:22,fontWeight:900,marginBottom:4}}>{selPlan.label}</div>
+          <div style={{color:"#6366f1",fontSize:28,fontWeight:900,marginBottom:4}}>{selPlan.price}</div>
+          <div style={{color:"rgba(255,255,255,.4)",fontSize:12}}>{selPlan.desc}</div>
+        </div>
+        <div style={{background:"rgba(255,255,255,.05)",borderRadius:12,padding:16,marginBottom:24}}>
+          <div style={{color:"rgba(255,255,255,.5)",fontSize:11,fontWeight:700,marginBottom:10}}>YOU GET:</div>
+          {["All exam access","AI Tutor","Previous-year question bank","Advanced Analytics","Leaderboard","No daily limits"].map(f=>(
+            <div key={f} style={{display:"flex",gap:10,marginBottom:8,alignItems:"center"}}>
+              <div style={{width:16,height:16,background:"#10b981",borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:9,fontWeight:900,flexShrink:0}}>v</div>
+              <span style={{color:"#fff",fontSize:13}}>{f}</span>
+            </div>
+          ))}
+        </div>
+        <div style={{marginTop:"auto"}}>
+          <button onClick={activatePremium} style={{width:"100%",background:"linear-gradient(135deg,#10b981,#059669)",color:"#fff",border:"none",borderRadius:14,padding:"16px",fontSize:16,fontWeight:900,cursor:"pointer",marginBottom:10,boxShadow:"0 4px 20px rgba(16,185,129,.4)"}}>
+            Confirm &amp; Activate -- {selPlan.price}
+          </button>
+          <button onClick={()=>setStep("plans")} style={{width:"100%",background:"transparent",color:"rgba(255,255,255,.4)",border:"1px solid rgba(255,255,255,.15)",borderRadius:12,padding:"12px",fontSize:13,cursor:"pointer"}}>
+            Change Plan
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  // Main plans screen
+  return (
+    <div style={{height:"100%",background:"#08101a",display:"flex",flexDirection:"column"}}>
+      <div style={{background:"#1a237e",padding:"12px 16px",display:"flex",alignItems:"center",gap:12,flexShrink:0}}>
+        <button onClick={onBack} style={{background:"none",border:"none",color:"#fff",fontSize:22,cursor:"pointer",lineHeight:1}}>&#8592;</button>
+        <div style={{color:"#fff",fontWeight:900,fontSize:15}}>Upgrade to Premium</div>
+      </div>
+      <div style={{flex:1,overflow:"auto",padding:16}}>
+        <div style={{textAlign:"center",marginBottom:20}}>
+          <div style={{color:"#fff",fontSize:22,fontWeight:900,marginBottom:6}}>ExamForge Premium</div>
+          <div style={{color:"rgba(255,255,255,.4)",fontSize:13}}>Unlock every feature. Master every exam.</div>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:20}}>
+          {[["All Exams","15+ exams"],["AI Tutor","Smart help"],["PYQ Bank","10k+ Qs"]].map(([t,d])=>(
+            <div key={t} style={{background:"rgba(99,102,241,.12)",border:"1px solid rgba(99,102,241,.25)",borderRadius:10,padding:"10px 8px",textAlign:"center"}}>
+              <div style={{color:"#a5b4fc",fontWeight:700,fontSize:12}}>{t}</div>
+              <div style={{color:"rgba(255,255,255,.4)",fontSize:10,marginTop:2}}>{d}</div>
+            </div>
+          ))}
+        </div>
+        <div style={{color:"rgba(255,255,255,.5)",fontSize:11,fontWeight:700,marginBottom:10}}>SELECT PLAN:</div>
+        {PLANS.map(p=>(
+          <button key={p.id} onClick={()=>setPlan(p.id)} style={{width:"100%",background:plan===p.id?"rgba(99,102,241,.2)":"rgba(255,255,255,.04)",border:`2px solid ${plan===p.id?"#6366f1":"rgba(255,255,255,.08)"}`,borderRadius:14,padding:"14px 16px",color:"#fff",textAlign:"left",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,boxSizing:"border-box"}}>
+            <div>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <span style={{fontWeight:800,fontSize:14}}>{p.label}</span>
+                {p.badge&&<span style={{background:p.badge==="BEST DEAL"?"#f59e0b":p.badge==="POPULAR"?"#10b981":"#6366f1",color:"#000",borderRadius:5,padding:"1px 7px",fontSize:9,fontWeight:900}}>{p.badge}</span>}
+              </div>
+              <div style={{color:"rgba(255,255,255,.35)",fontSize:11,marginTop:3}}>{p.desc}</div>
+            </div>
+            <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end"}}>
+              <span style={{color:plan===p.id?"#a5b4fc":"#fff",fontWeight:900,fontSize:18}}>{p.price}</span>
+              {plan===p.id&&<span style={{color:"#6366f1",fontSize:9,marginTop:2}}>SELECTED</span>}
+            </div>
+          </button>
+        ))}
+        <button onClick={()=>setStep("confirm")} style={{width:"100%",background:"linear-gradient(135deg,#6366f1,#8b5cf6)",color:"#fff",border:"none",borderRadius:14,padding:"16px",fontSize:16,fontWeight:900,cursor:"pointer",marginTop:8,marginBottom:12,boxShadow:"0 4px 24px rgba(99,102,241,.4)"}}>
+          Continue with {selPlan.label} -- {selPlan.price}
+        </button>
+        <div style={{textAlign:"center",color:"rgba(255,255,255,.25)",fontSize:10}}>
+          Instant activation. No hidden fees. 7-day refund policy.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// OFFICIAL EXAM INSTRUCTION SCREENS
+// ============================================================
+function InstructionScreen({exam, initialQuestions, onStart, onBack}){
+  const isNTA=exam.ui==="NTA"||exam.ui==="NTA_ADV"||exam.ui==="NEET";
+  const built=initialQuestions||buildExam(exam)||{};
+  const totalQ=Object.values(built).reduce((s,qs)=>s+qs.length,0);
+  const uniq=countUnique(built);
+  const PAT=EXAM_PATTERNS[exam.id]||null;
+  const [yrSel,setYrSel]=useState(NEET_FILTER.year);
+  const PATx=EXAM_PATTERNS[exam.id]||null;
+  const strictSt=PATx&&PATx.strictBank?pyqStatus():null;
+  const blocked=!!(strictSt&&!strictSt.ok);
+  const bankYears=(NEET_BANK.state==="ready"&&NEET_BANK.data)?Array.from(new Set(Object.keys(NEET_BANK.data.by).reduce((a,k)=>a.concat(NEET_BANK.data.by[k].map(b=>b.y)),[]))).sort():[];
+  const pyqBox=strictSt?(
+    <div style={{background:strictSt.ok?"#e8f5e9":"#fff3e0",border:"1px solid "+(strictSt.ok?"#66bb6a":"#ffa726"),borderRadius:8,padding:12,margin:"12px 0",fontSize:12,color:"#222",lineHeight:1.6}}>
+      <div style={{fontWeight:800,marginBottom:6}}>Verified question bank</div>
+      <div>{strictSt.msg}</div>
+      {bankYears.length>0?<div style={{marginTop:8}}>
+        <label style={{fontSize:11,color:"#555",marginRight:8}}>Year filter:</label>
+        <select value={yrSel} onChange={e=>{NEET_FILTER.year=e.target.value;setYrSel(e.target.value);}} style={{padding:"5px 8px",borderRadius:6,border:"1px solid #bbb",color:"#111",background:"#fff"}}>
+          <option value="all">All verified years</option>
+          {bankYears.map(y=><option key={y} value={String(y)}>NEET {y}</option>)}
+        </select>
+      </div>:null}
+    </div>
+  ):null;
+
+  if(isNTA) return (
+    <div style={{height:"100%",background:"#f0f0f0",display:"flex",flexDirection:"column"}}>
+      <div style={{background:"#1a237e",padding:"10px 16px",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <button onClick={onBack} style={{background:"none",border:"1px solid rgba(255,255,255,.4)",color:"#fff",borderRadius:4,padding:"4px 10px",cursor:"pointer",fontSize:12}}>Back</button>
+        <div style={{textAlign:"center"}}>
+          <div style={{color:"#fff",fontWeight:900,fontSize:13}}>{PAT?PAT.conductor:"National Testing Agency"}</div>
+          <div style={{color:"rgba(255,255,255,.7)",fontSize:10}}>{exam.name}</div>
+        </div>
+        <div style={{width:60}}/>
+      </div>
+      <div style={{flex:1,overflow:"auto",padding:16,background:"#fff"}}>
+        <div style={{maxWidth:700,margin:"0 auto"}}>
+          <div style={{background:"#1a237e",color:"#fff",padding:"12px 16px",borderRadius:8,marginBottom:16,textAlign:"center"}}>
+            <div style={{fontWeight:900,fontSize:16}}>{exam.name} - General Instructions</div>
+          </div>
+          <div style={{background:"#fff8e1",border:"1px solid #f9a825",borderRadius:8,padding:14,marginBottom:14}}>
+            <div style={{fontWeight:700,color:"#f57f17",marginBottom:8,fontSize:13}}>IMPORTANT INSTRUCTIONS:</div>
+            <div style={{fontSize:12,color:"#333",lineHeight:1.8}}>
+              {PAT?PAT.rules.map((r,k)=><div key={k}>{k+1}. {r}</div>):[
+                <div key="a">1. Total Questions: <b>{totalQ}</b> | Duration: <b>{exam.dur} minutes</b></div>,
+                <div key="b">2. Marking Scheme: <b>+{exam.pos} for correct</b>, <b>-{exam.neg} for wrong</b>, <b>0 for unattempted</b></div>,
+                <div key="c">3. Each question has 4 options with only ONE correct answer.</div>,
+                <div key="d">4. Use Save and Next to save an answer; Mark for Review to flag a question.</div>,
+                <div key="e">5. The test auto-submits when time runs out.</div>
+              ]}
+              {PAT&&PAT.note?<div style={{marginTop:8,fontSize:11,color:"#6d4c41"}}>{PAT.note}</div>:null}
+              {uniq.unique<uniq.total?<div style={{marginTop:8,fontSize:11,color:"#6d4c41"}}>Practice-bank note: this bank has {uniq.unique} unique questions for a {uniq.total}-question paper, so some questions repeat.</div>:null}
+            </div>
+          </div>
+          <div style={{background:"#e8f5e9",border:"1px solid #4caf50",borderRadius:8,padding:14,marginBottom:14}}>
+            <div style={{fontWeight:700,color:"#2e7d32",marginBottom:8,fontSize:13}}>QUESTION PALETTE LEGEND:</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,fontSize:12}}>
+              {[["#6b7280","Not Visited"],["#ef4444","Not Answered"],["#10b981","Answered"],["#8b5cf6","Marked for Review"],["#6366f1","Ans. + Marked"]].map(([c,l])=>(
+                <div key={l} style={{display:"flex",alignItems:"center",gap:8}}>
+                  <div style={{width:22,height:22,background:c,borderRadius:4,flexShrink:0,color:"#fff",display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:700}}>1</div>
+                  <span>{l}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          {pyqBox}
+          <div style={{textAlign:"center",marginTop:20,opacity:blocked?0.45:1}}>
+            <div style={{color:"#555",fontSize:12,marginBottom:12}}>By clicking "I am ready", you agree to the exam rules.</div>
+            <button onClick={blocked?undefined:onStart} disabled={blocked} style={{background:"#1b5e20",color:"#fff",border:"none",borderRadius:8,padding:"14px 48px",fontSize:15,fontWeight:900,cursor:"pointer"}}>
+              I am ready to begin
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{height:"100%",background:"#0a0a1a",display:"flex",flexDirection:"column"}}>
+      <div style={{background:exam.color||"#1a237e",padding:"12px 16px",display:"flex",alignItems:"center",gap:12}}>
+        <button onClick={onBack} style={{background:"none",border:"1px solid rgba(255,255,255,.3)",color:"#fff",borderRadius:6,padding:"5px 12px",cursor:"pointer",fontSize:12}}>Back</button>
+        <div style={{color:"#fff",fontWeight:900,fontSize:14}}>{exam.name} - Instructions</div>
+      </div>
+      <div style={{flex:1,overflow:"auto",padding:16}}>
+        <div style={{background:"rgba(255,255,255,.05)",border:"1px solid rgba(255,255,255,.1)",borderRadius:12,padding:16,marginBottom:12}}>
+          <div style={{color:"#f59e0b",fontWeight:700,marginBottom:8}}>Exam Details</div>
+          <div style={{color:"rgba(255,255,255,.7)",fontSize:12,lineHeight:2}}>
+            <div>Total Questions: <b style={{color:"#fff"}}>{totalQ}</b></div>
+            <div>Duration: <b style={{color:"#fff"}}>{exam.dur} minutes</b></div>
+            <div>Marking: <b style={{color:"#10b981"}}>+{exam.pos}</b> correct | <b style={{color:"#ef4444"}}>-{exam.neg}</b> wrong | 0 unattempted</div>
+            <div>Sections: <b style={{color:"#fff"}}>{exam.subj.join(", ")}</b></div>
+          </div>
+        </div>
+        {pyqBox}
+          <div style={{textAlign:"center",marginTop:20,opacity:blocked?0.45:1}}>
+          <button onClick={blocked?undefined:onStart} disabled={blocked} style={{background:exam.color||"#6366f1",color:"#fff",border:"none",borderRadius:12,padding:"14px 48px",fontSize:15,fontWeight:900,cursor:"pointer"}}>
+            Start Test
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// ACTIVE EXAM - Official NTA UI with correct palette behavior
+// ============================================================
+function ActiveExam({exam, questions, onSubmit, candidate}){
+  return <ExamEngine exam={exam} questions={questions} onSubmit={onSubmit} candidate={candidate} saveKey={null} proctor={false} />;
+}
+
+// ============================================================
+// RESULT SCREEN
+// ============================================================
+function ResultScreen({result, onBack, onRetake}){
+  const [tab,setTab]=useState("overview");
+  const {score,total,correct,wrong,skipped,bySubj,timeTaken,totalQ,exam}=result;
+  const pct=total?Math.max(0,Math.round(score/total*100)):0;
+  const acc=totalQ?Math.round(correct/totalQ*100):0;
+
+  return (
+    <div style={{height:"100%",background:"#08101a",display:"flex",flexDirection:"column"}}>
+      <div style={{background:exam?.color||"#1a237e",padding:"12px 16px",display:"flex",alignItems:"center",gap:12,flexShrink:0}}>
+        <button onClick={onBack} style={{background:"none",border:"none",color:"#fff",fontSize:22,cursor:"pointer"}}>&#8592;</button>
+        <div>
+          <div style={{color:"#fff",fontWeight:900,fontSize:14}}>{exam?.name} - Result</div>
+          <div style={{color:"rgba(255,255,255,.6)",fontSize:10}}>Test completed</div>
+        </div>
+      </div>
+      <div style={{background:"linear-gradient(180deg,rgba(26,35,126,.8),rgba(8,16,26,1))",padding:"20px 16px",textAlign:"center",flexShrink:0}}>
+        <div style={{fontSize:56,fontWeight:900,color:pct>=60?"#10b981":pct>=40?"#f59e0b":"#ef4444"}}>{pct}%</div>
+        <div style={{color:"rgba(255,255,255,.6)",fontSize:13}}>Score: {score} / {total}</div>
+        <div style={{display:"flex",justifyContent:"center",gap:20,marginTop:14}}>
+          {[{l:"Correct",v:correct,c:"#10b981"},{l:"Wrong",v:wrong,c:"#ef4444"},{l:"Skipped",v:skipped,c:"#6b7280"},{l:"Accuracy",v:acc+"%",c:"#6366f1"}].map(m=>(
+            <div key={m.l} style={{textAlign:"center"}}>
+              <div style={{color:m.c,fontWeight:900,fontSize:20}}>{m.v}</div>
+              <div style={{color:"rgba(255,255,255,.4)",fontSize:10}}>{m.l}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div style={{display:"flex",background:"#0d1b2a",borderBottom:"1px solid #1a2840",flexShrink:0}}>
+        {[["overview","Overview"],["subjects","By Subject"],["qs","Questions"]].map(([t,l])=>(
+          <button key={t} onClick={()=>setTab(t)} style={{flex:1,padding:"10px",background:"none",border:"none",borderBottom:`2px solid ${tab===t?"#6366f1":"transparent"}`,color:tab===t?"#6366f1":"#8892b0",fontSize:11,fontWeight:700,cursor:"pointer"}}>{l}</button>
+        ))}
+      </div>
+      <div style={{flex:1,overflow:"auto",padding:16}}>
+        {tab==="overview"&&(
+          <div>
+            <div style={{background:"rgba(255,255,255,.05)",borderRadius:12,padding:16,marginBottom:12}}>
+              <div style={{color:"rgba(255,255,255,.5)",fontSize:11,marginBottom:8}}>Time Analysis</div>
+              <div style={{color:"#fff",fontSize:13}}>Time taken: {Math.floor(timeTaken/60)}m {timeTaken%60}s</div>
+              <div style={{color:"rgba(255,255,255,.4)",fontSize:11,marginTop:4}}>Avg per question: {totalQ?Math.round(timeTaken/totalQ):0}s</div>
+            </div>
+            <div style={{display:"flex",gap:10}}>
+              <button onClick={onRetake} style={{flex:1,padding:"13px",background:"#6366f1",color:"#fff",border:"none",borderRadius:10,cursor:"pointer",fontWeight:700,fontSize:13}}>Retake</button>
+              <button onClick={onBack} style={{flex:1,padding:"13px",background:"rgba(255,255,255,.07)",color:"#fff",border:"1px solid rgba(255,255,255,.15)",borderRadius:10,cursor:"pointer",fontWeight:700,fontSize:13}}>Home</button>
+            </div>
+          </div>
+        )}
+        {tab==="subjects"&&Object.entries(bySubj||{}).map(([sv,d])=>{
+          const sp=d.total?Math.round(d.correct/d.total*100):0;
+          return (
+            <div key={sv} style={{background:"rgba(255,255,255,.05)",borderRadius:10,padding:14,marginBottom:10}}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
+                <span style={{color:"#fff",fontWeight:700}}>{sv}</span>
+                <span style={{color:sp>=60?"#10b981":sp>=40?"#f59e0b":"#ef4444",fontWeight:700}}>{sp}%</span>
+              </div>
+              <div style={{display:"flex",gap:12,fontSize:11}}>
+                <span style={{color:"#10b981"}}>C:{d.correct}</span>
+                <span style={{color:"#ef4444"}}>W:{d.wrong}</span>
+                <span style={{color:"#6b7280"}}>S:{d.skipped}</span>
+              </div>
+              <div style={{height:4,background:"#1a2840",borderRadius:2,marginTop:8}}>
+                <div style={{height:"100%",width:sp+"%",background:sp>=60?"#10b981":sp>=40?"#f59e0b":"#ef4444",borderRadius:2}}/>
+              </div>
+            </div>
+          );
+        })}
+        {tab==="qs"&&(result.questions||[]).map((q,i)=>(
+          <div key={i} style={{background:"rgba(255,255,255,.04)",border:`1px solid ${q.result==="correct"?"rgba(16,185,129,.3)":q.result==="wrong"?"rgba(239,68,68,.3)":"rgba(255,255,255,.1)"}`,borderRadius:8,padding:12,marginBottom:8}}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+              <span style={{color:"rgba(255,255,255,.4)",fontSize:10}}>Q{i+1} - {q.subj}</span>
+              <span style={{color:q.result==="correct"?"#10b981":q.result==="partial"?"#f59e0b":q.result==="wrong"?"#ef4444":"#6b7280",fontSize:10,fontWeight:700}}>{q.result==="correct"?"Correct":q.result==="wrong"?"Wrong":q.result==="partial"?"Partial":"Skipped"}</span>
+            </div>
+            <div style={{color:"rgba(255,255,255,.7)",fontSize:12}}>{(q.t||"").slice(0,100)}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// HOME DASHBOARD
+// ============================================================
+function HomeScreen({user, ctrl, onSelectExam, onOpenPYQ}){
+  const results=user.data?.results||[];
+  const streak=user.data?.streak||0;
+  const isPaid=user.plan==="paid"&&user.planExpiry>Date.now();
+  const announce=(ctrl.announcements||[]).slice(0,1)[0];
+
+  const CATS=["All","India","USA","Global","UK"];
+  const [cat,setCat]=useState("All");
+  const filtered=EXAMS.filter(e=>cat==="All"||e.country===cat||e.cat===cat);
+
+  return (
+    <div style={{height:"100%",overflow:"auto",paddingBottom:80}}>
+      {announce&&<div style={{background:"linear-gradient(135deg,#7c3aed,#6366f1)",padding:"10px 16px",color:"#fff",fontSize:12,fontWeight:600,display:"flex",alignItems:"center",gap:8}}>
+        <span>!</span>{announce.text}
+      </div>}
+      <div style={{padding:"16px 16px 0"}}>
+        <div style={{marginBottom:16}}>
+          <div style={{color:"#fff",fontSize:20,fontWeight:900}}>Hello, {user.name}!</div>
+          <div style={{color:"rgba(255,255,255,.4)",fontSize:12}}>{isPaid?"Premium Member - All features unlocked":"Free Plan"}</div>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:20}}>
+          {[
+            {l:"Streak",v:streak+"d",c:"#f59e0b"},
+            {l:"Tests",v:results.length,c:"#10b981"},
+            {l:"Best %",v:results.length?Math.max(...results.map(r=>r.total?Math.round(r.score/r.total*100):0))+"%":"--",c:"#6366f1"},
+          ].map(m=>(
+            <div key={m.l} style={{background:"rgba(255,255,255,.06)",border:"1px solid rgba(255,255,255,.08)",borderRadius:12,padding:"12px 8px",textAlign:"center"}}>
+              <div style={{fontSize:20,fontWeight:900,color:m.c}}>{m.v}</div>
+              <div style={{fontSize:10,color:"rgba(255,255,255,.4)",marginTop:2}}>{m.l}</div>
+            </div>
+          ))}
+        </div>
+        {results[0]&&(
+          <div style={{background:"rgba(99,102,241,.12)",border:"1px solid rgba(99,102,241,.25)",borderRadius:12,padding:14,marginBottom:20}}>
+            <div style={{color:"rgba(255,255,255,.5)",fontSize:10,marginBottom:4}}>LAST TEST</div>
+            <div style={{color:"#fff",fontWeight:700,fontSize:13}}>{results[0].exam?.name}</div>
+            <div style={{color:"#a5b4fc",fontSize:12,marginTop:2}}>Score: {results[0].score}/{results[0].total} | {results[0].correct}C {results[0].wrong}W {results[0].skipped}S</div>
+          </div>
+        )}
+        <button onClick={onOpenPYQ} style={{width:"100%",background:"rgba(46,125,50,.16)",border:"1px solid rgba(76,175,80,.35)",borderRadius:14,padding:"14px 16px",color:"#fff",textAlign:"left",cursor:"pointer",marginBottom:14}}><div style={{fontWeight:900,fontSize:14}}>PYQ PDF Import</div><div style={{color:"rgba(255,255,255,.55)",fontSize:10,marginTop:4}}>Upload a question-paper PDF → extract → review → CBT test</div></button>
+        {/* Category filter */}
+        <div style={{display:"flex",gap:8,marginBottom:12,overflowX:"auto",paddingBottom:4}}>
+          {CATS.map(c=>(
+            <button key={c} onClick={()=>setCat(c)} style={{padding:"5px 14px",background:cat===c?"#6366f1":"rgba(255,255,255,.07)",color:cat===c?"#fff":"rgba(255,255,255,.5)",border:`1px solid ${cat===c?"#6366f1":"rgba(255,255,255,.1)"}`,borderRadius:20,fontSize:11,fontWeight:700,cursor:"pointer",flexShrink:0}}>{c}</button>
+          ))}
+        </div>
+        <div style={{color:"rgba(255,255,255,.6)",fontSize:12,fontWeight:700,marginBottom:10}}>{filtered.length} Exams Available</div>
+        {filtered.map(e=>(
+          <button key={e.id} onClick={()=>onSelectExam(e)} style={{width:"100%",background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.08)",borderRadius:14,padding:"14px 16px",color:"#fff",textAlign:"left",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+            <div>
+              <div style={{fontWeight:700,fontSize:14,display:"flex",alignItems:"center",gap:8}}>
+                {e.name}
+                {!isPaid&&e.id!=="JEE_MAIN"&&e.id!=="NEET"&&<span style={{background:"#f59e0b",color:"#000",borderRadius:4,padding:"1px 5px",fontSize:8,fontWeight:900}}>PRO</span>}
+              </div>
+              <div style={{color:"rgba(255,255,255,.35)",fontSize:10,marginTop:3}}>{e.country} | {e.cat} | {e.totalQ}Q | {e.dur}min | +{e.pos}/-{e.neg}</div>
+            </div>
+            <div style={{width:32,height:32,background:e.color||"#1a237e",borderRadius:8,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:11,fontWeight:900,flexShrink:0}}>
+              {e.name.charAt(0)}
+            </div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// PYQ IMPORT / LIBRARY SCREEN
+// ============================================================
+function PYQImportScreen({onBack,onStartExam}){
+  const [imports,setImports]=useState([]);const [busy,setBusy]=useState(false);const [progress,setProgress]=useState({});const [err,setErr]=useState("");const [notice,setNotice]=useState("");const [filter,setFilter]=useState({exam:"all",year:"all",subject:"all"});const [review,setReview]=useState(null);const [reviewQs,setReviewQs]=useState([]);const [reviewIndex,setReviewIndex]=useState(0);
+  const refresh=()=>pyqListImports().then(setImports).catch(e=>setErr(String(e.message||e)));
+  useEffect(()=>{refresh();},[]);
+  async function handleFile(e){const file=e.target.files?.[0];e.target.value="";if(!file)return;setBusy(true);setErr("");setNotice("");setProgress({stage:"Reading PDF",page:0,totalPages:0,percent:1});
+    try{
+      const fileHash=pyqHashText(file.name+":"+file.size+":"+file.lastModified);const existing=await pyqListImports();if(existing.some(x=>x.fileHash===fileHash)){setNotice("This PDF is already imported.");setBusy(false);return;}
+      const meta={id:"imp_"+fileHash+"_"+Date.now(),fileName:file.name,fileSize:file.size,fileHash,createdAt:Date.now(),exam:"",year:"",subject:"",status:"processing",questionCount:0,validCount:0,reviewCount:0};
+      const parsed=await pyqExtractPdf(file,p=>{const pct=p.totalPages?Math.min(99,Math.round((p.page/p.totalPages)*90)):10;setProgress({...p,stage:p.ocr?"OCR fallback":"Extracting text",percent:pct});});
+      const raw=parsed.lines.map(x=>x.text).join("\n");meta.exam=pyqGuessExam(file.name,raw)||"";meta.year=pyqGuessYear(file.name,raw)||"unknown";meta.subject=pyqGuessSubject(file.name,raw)||"";
+      const qs=pyqParseLines(parsed.lines,{...meta,exam:meta.exam,year:meta.year,subject:meta.subject});
+      const dupSet=new Set();const allExisting=await pyqListQuestions();allExisting.forEach(q=>dupSet.add(pyqHashText(q.question+"|"+(q.options||[]).join("|"))));
+      const fresh=qs.filter(q=>{const h=pyqHashText(q.question+"|"+(q.options||[]).join("|"));if(dupSet.has(h))return false;dupSet.add(h);return true;});
+      fresh.forEach(q=>{q.importId=meta.id;q.exam=meta.exam;q.year=meta.year;q.subject=q.subject||meta.subject||"";q.matchLeft=q.matchLeft||[];q.matchRight=q.matchRight||[];});
+      meta.status="ready";meta.questionCount=fresh.length;meta.validCount=fresh.filter(q=>q.verified).length;meta.reviewCount=fresh.length-meta.validCount;meta.pages=parsed.pages;meta.scanned=parsed.scanned;
+      await pyqPutMany(meta,fresh);setNotice(`Imported ${fresh.length} questions. ${meta.validCount} are currently validated; ${meta.reviewCount} need review.`);await refresh();
+    }catch(e){console.error(e);setErr("PDF processing failed safely: "+String(e.message||e));}finally{setBusy(false);setProgress({});}
+  }
+  async function openReview(imp){const qs=(await pyqListQuestions()).filter(q=>q.importId===imp.id);setReview({imp,edit:null});setReviewQs(qs);setReviewIndex(0);}
+  const currentReview=reviewQs[reviewIndex];
+  function updateReview(p){setReviewQs(a=>a.map((q,i)=>i===reviewIndex?{...q,...p}:q));}
+  async function saveReview(){if(!currentReview)return;const q={...currentReview,question:pyqNormalizeText(currentReview.question),t:pyqNormalizeText(currentReview.question),options:(currentReview.options||[]).map(pyqNormalizeText),verified:currentReview.answer!==""&&currentReview.answer!=null&&currentReview.options?.length>=2,extractionStatus:currentReview.answer!==""&&currentReview.answer!=null&&currentReview.options?.length>=2?"valid":"needs_review"};await pyqPutQuestion(q);setReviewQs(a=>a.map((x,i)=>i===reviewIndex?q:x));setNotice("Question saved.");await refresh();}
+  async function startImport(imp,onlyValidated=false){const qs=(await pyqListQuestions()).filter(q=>q.importId===imp.id&&(!onlyValidated||q.verified));if(!qs.length){setErr("No questions are available for this test filter.");return;}onStartExam(pyqBuildImportedExam(qs,{exam:imp.exam||"",year:imp.year||"unknown",fileName:imp.fileName}));}
+  async function randomTest(){const all=await pyqListQuestions();const qs=all.filter(q=>q.verified&&(filter.exam==="all"||q.exam===filter.exam)&&(filter.year==="all"||String(q.year)===String(filter.year))&&(filter.subject==="all"||q.subject===filter.subject));if(!qs.length){setErr("No validated PYQs match these filters.");return;}const n=Math.min(180,qs.length);onStartExam(pyqBuildImportedExam(shuffleArr(qs).slice(0,n),{exam:filter.exam==="all"?"NEET":filter.exam,year:filter.year==="all"?"all":filter.year,fileName:"Validated PYQ Random Test"}));}
+  const years=Array.from(new Set(imports.map(x=>x.year).filter(Boolean))).sort();const subjects=Array.from(new Set(imports.map(x=>x.subject).filter(Boolean))).sort();
+  return <div style={{height:"100%",background:"#08101a",display:"flex",flexDirection:"column"}}>
+    <div style={{background:"#1a237e",padding:"12px 16px",display:"flex",alignItems:"center",gap:12}}><button onClick={onBack} style={{background:"none",border:"none",color:"#fff",fontSize:22,cursor:"pointer"}}>←</button><div style={{color:"#fff",fontWeight:900,fontSize:15}}>PYQ PDF Import</div></div>
+    <div style={{flex:1,overflow:"auto",padding:16}}>
+      <div style={{background:"rgba(255,255,255,.05)",border:"1px solid rgba(255,255,255,.1)",borderRadius:14,padding:16,marginBottom:14}}>
+        <div style={{color:"#fff",fontWeight:900,fontSize:16,marginBottom:6}}>Upload PYQ PDF</div><div style={{color:"rgba(255,255,255,.5)",fontSize:11,lineHeight:1.6,marginBottom:12}}>Text PDFs are extracted first. OCR is used only when the PDF appears scanned. Questions, source pages, numbering and detected answer mappings are kept for review.</div>
+        <label style={{display:"block",background:"#6366f1",color:"#fff",padding:"13px",borderRadius:10,textAlign:"center",fontWeight:800,cursor:busy?"wait":"pointer",opacity:busy?.6:1}}>{busy?"Processing…":"Choose PDF"}<input type="file" accept="application/pdf,.pdf" disabled={busy} onChange={handleFile} style={{display:"none"}}/></label>
+        {busy&&<div style={{marginTop:12}}><div style={{height:8,background:"rgba(255,255,255,.1)",borderRadius:10,overflow:"hidden"}}><div style={{height:"100%",width:(progress.percent||1)+"%",background:"#10b981",transition:"width .2s"}}/></div><div style={{color:"rgba(255,255,255,.55)",fontSize:11,marginTop:6}}>{progress.stage||"Processing"}{progress.page?` — Page ${progress.page}/${progress.totalPages||"?"}`:""}{progress.detail?` — ${progress.detail}`:""}</div></div>}
+      </div>
+      {err&&<div style={{background:"rgba(239,68,68,.12)",border:"1px solid rgba(239,68,68,.3)",borderRadius:10,padding:12,color:"#fca5a5",fontSize:12,marginBottom:12}}>{err}</div>}
+      {notice&&<div style={{background:"rgba(16,185,129,.12)",border:"1px solid rgba(16,185,129,.3)",borderRadius:10,padding:12,color:"#6ee7b7",fontSize:12,marginBottom:12}}>{notice}</div>}
+      <div style={{background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.08)",borderRadius:14,padding:14,marginBottom:14}}>
+        <div style={{color:"#fff",fontWeight:800,fontSize:13,marginBottom:10}}>Random validated PYQ</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>{[["exam",["all","NEET","JEE Main","JEE Advanced"]],["year",["all",...years]],["subject",["all",...subjects]]].map(([k,vals])=><select key={k} value={filter[k]} onChange={e=>setFilter({...filter,[k]:e.target.value})} style={{padding:9,borderRadius:8,border:"1px solid #445",background:"#111827",color:"#fff"}}>{vals.map(v=><option key={v} value={v}>{v==="all"?"All "+k:v}</option>)}</select>)}</div>
+        <button onClick={randomTest} style={{width:"100%",marginTop:10,padding:11,border:0,borderRadius:9,background:"#2e7d32",color:"#fff",fontWeight:800,cursor:"pointer"}}>Start Random PYQ Test</button>
+      </div>
+      <div style={{color:"rgba(255,255,255,.55)",fontSize:11,fontWeight:800,marginBottom:8}}>IMPORTED PYQ PDFs</div>
+      {imports.length===0?<div style={{color:"rgba(255,255,255,.35)",fontSize:12,padding:20,textAlign:"center"}}>No PDFs imported yet.</div>:imports.map(imp=><div key={imp.id} style={{background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.08)",borderRadius:12,padding:12,marginBottom:8}}><div style={{color:"#fff",fontWeight:800,fontSize:13,wordBreak:"break-word"}}>{imp.fileName}</div><div style={{color:"rgba(255,255,255,.45)",fontSize:10,marginTop:4}}>{imp.exam||"Exam needs review"} · {imp.year||"Year needs review"} · {imp.pages||"?"} pages · {imp.questionCount||0} questions</div><div style={{color:imp.reviewCount?"#fbbf24":"#6ee7b7",fontSize:10,marginTop:4}}>{imp.validCount||0} validated · {imp.reviewCount||0} needs review</div><div style={{display:"flex",gap:7,marginTop:9}}><button onClick={()=>openReview(imp)} style={{flex:1,padding:9,border:0,borderRadius:8,background:"#455a64",color:"#fff",fontWeight:800,cursor:"pointer"}}>Review</button><button onClick={()=>startImport(imp,false)} style={{flex:1,padding:9,border:0,borderRadius:8,background:"#1a237e",color:"#fff",fontWeight:800,cursor:"pointer"}}>Start Test</button></div></div>)}
+    </div>
+    {review&&currentReview?<div style={{position:"fixed",inset:0,zIndex:3000,background:"rgba(0,0,0,.78)",display:"flex",alignItems:"center",justifyContent:"center",padding:12}}><div style={{background:"#fff",width:"100%",maxWidth:700,maxHeight:"92vh",overflow:"auto",borderRadius:12,padding:16,color:"#111"}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}><b>Review Q{currentReview.questionNumber}</b><button onClick={()=>setReview(null)} style={{border:0,background:"#eee",borderRadius:6,padding:"5px 9px"}}>Close</button></div><div style={{fontSize:10,color:"#666",marginBottom:8}}>Source: {currentReview.source?.file} · Page {currentReview.source?.page||"?"}</div><textarea value={currentReview.question||""} onChange={e=>updateReview({question:e.target.value})} rows={7} style={{width:"100%",boxSizing:"border-box",padding:9,marginBottom:8}}/>{(currentReview.options||[]).map((o,i)=><input key={i} value={o} onChange={e=>updateReview({options:(currentReview.options||[]).map((x,j)=>j===i?e.target.value:x)})} placeholder={`Option ${String.fromCharCode(65+i)}`} style={{width:"100%",boxSizing:"border-box",padding:8,marginBottom:6}}/>)}<div style={{display:"flex",gap:8,alignItems:"center",marginTop:4}}><label>Answer</label><select value={currentReview.answer==null?"":currentReview.answer} onChange={e=>updateReview({answer:e.target.value===""?null:Number(e.target.value)})} style={{padding:7}}><option value="">Not provided</option>{(currentReview.options||[]).map((_,i)=><option key={i} value={i}>{String.fromCharCode(65+i)}</option>)}</select><label style={{marginLeft:8}}>Subject</label><input value={currentReview.subject||""} onChange={e=>updateReview({subject:e.target.value})} style={{padding:7,flex:1}}/></div><div style={{display:"flex",justifyContent:"space-between",marginTop:12}}><div><button disabled={reviewIndex<=0} onClick={()=>setReviewIndex(i=>i-1)} style={{padding:"8px 12px",marginRight:6}}>Previous</button><button disabled={reviewIndex>=reviewQs.length-1} onClick={()=>setReviewIndex(i=>i+1)} style={{padding:"8px 12px"}}>Next</button></div><button onClick={saveReview} style={{padding:"9px 16px",background:"#1a237e",color:"#fff",border:0,borderRadius:7,fontWeight:800}}>Save & Validate</button></div><div style={{fontSize:10,color:"#666",marginTop:8}}>Question {reviewIndex+1} of {reviewQs.length}. Saving marks it validated only when an answer and at least two options are present.</div></div></div>:null}
+  </div>;
+}
+
+// ============================================================
+// GOALS SCREEN
+// ============================================================
+function GoalsScreen({user, setUser, onBack}){
+  const [dailyQ,setDailyQ]=useState(user.data?.goals?.dailyQ||30);
+  const [targetScore,setTargetScore]=useState(user.data?.goals?.targetScore||80);
+  const [saved,setSaved]=useState(false);
+
+  const save=()=>{
+    const upd={...user,data:{...user.data,goals:{...user.data?.goals,dailyQ,targetScore}}};
+    if(user.email&&user.email!=="guest@"){const db=LS.get("users_db",{});db[user.email]=upd;LS.set("users_db",db);}
+    setUser(upd); setSaved(true); setTimeout(()=>setSaved(false),2000);
+  };
+
+  return (
+    <div style={{height:"100%",background:"#08101a",display:"flex",flexDirection:"column"}}>
+      <div style={{background:"#1a237e",padding:"12px 16px",display:"flex",alignItems:"center",gap:12,flexShrink:0}}>
+        <button onClick={onBack} style={{background:"none",border:"none",color:"#fff",fontSize:22,cursor:"pointer"}}>&#8592;</button>
+        <div style={{color:"#fff",fontWeight:900,fontSize:14}}>Study Goals</div>
+      </div>
+      <div style={{flex:1,overflow:"auto",padding:16}}>
+        {saved&&<div style={{background:"rgba(16,185,129,.15)",border:"1px solid rgba(16,185,129,.3)",borderRadius:8,padding:"8px 12px",color:"#10b981",fontSize:12,marginBottom:12,textAlign:"center"}}>Goals saved!</div>}
+        <div style={{background:"rgba(255,255,255,.05)",border:"1px solid rgba(255,255,255,.1)",borderRadius:12,padding:16,marginBottom:12}}>
+          <label style={{color:"rgba(255,255,255,.6)",fontSize:12,display:"block",marginBottom:8}}>Daily Questions Target: <b style={{color:"#fff"}}>{dailyQ}</b></label>
+          <input type="range" min={10} max={100} step={5} value={dailyQ} onChange={e=>setDailyQ(+e.target.value)} style={{width:"100%"}} />
+        </div>
+        <div style={{background:"rgba(255,255,255,.05)",border:"1px solid rgba(255,255,255,.1)",borderRadius:12,padding:16,marginBottom:20}}>
+          <label style={{color:"rgba(255,255,255,.6)",fontSize:12,display:"block",marginBottom:8}}>Target Score: <b style={{color:"#fff"}}>{targetScore}%</b></label>
+          <input type="range" min={30} max={100} step={5} value={targetScore} onChange={e=>setTargetScore(+e.target.value)} style={{width:"100%"}} />
+        </div>
+        <button onClick={save} style={{width:"100%",background:"#6366f1",color:"#fff",border:"none",borderRadius:12,padding:"13px",fontSize:14,fontWeight:800,cursor:"pointer"}}>Save Goals</button>
+        <div style={{marginTop:24}}>
+          <div style={{color:"rgba(255,255,255,.5)",fontSize:11,fontWeight:700,marginBottom:12}}>YOUR STATS</div>
+          {[
+            ["Tests Completed",(user.data?.results||[]).length],
+            ["Streak",`${user.data?.streak||0} days`],
+            ["XP Points",user.data?.xp||0],
+            ["Plan",user.plan==="paid"?"Premium":"Free"],
+          ].map(([l,v])=>(
+            <div key={l} style={{display:"flex",justifyContent:"space-between",padding:"10px 0",borderBottom:"1px solid rgba(255,255,255,.08)"}}>
+              <span style={{color:"rgba(255,255,255,.5)",fontSize:13}}>{l}</span>
+              <span style={{color:"#fff",fontWeight:700,fontSize:13}}>{v}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// ROOT APP
+// ============================================================
+function App(){
+  const [,setBankTick]=useState(0);
+  useEffect(()=>{loadNeetBank().then(()=>setBankTick(t=>t+1));},[]);
+  const [user,setUserState]=useState(null);
+  const [screen,setScreen]=useState("home");
+  const [examFlow,setExamFlow]=useState(null);
+  const ctrl=LS.get(CTRL_KEY,{apps:{free:true},maintenance:{free:false},features:{},announcements:[]});
+
+  useEffect(()=>{
+    const s=LS.get("active_session",null);
+    if(s&&Date.now()-s.ts<30*24*3600000){
+      const db=LS.get("users_db",{});
+      if(db[s.email]) setUserState(db[s.email]);
+    }
+  },[]);
+
+  const setUser=(u)=>{
+    setUserState(u);
+    if(u&&u.email&&u.email!=="guest@"){
+      const db=LS.get("users_db",{});db[u.email]=u;LS.set("users_db",db);
+    }
+  };
+
+  const nav=(s)=>{setScreen(s);setExamFlow(null);};
+
+  if(ctrl.apps?.free===false) return (
+    <div style={{minHeight:"100vh",background:"#0a0a1a",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",textAlign:"center",padding:20}}>
+      <div><div style={{fontSize:48,marginBottom:16}}>&#128274;</div><div style={{fontSize:20,fontWeight:700}}>App Offline</div><div style={{color:"rgba(255,255,255,.5)",marginTop:8}}>{ctrl.maintenanceMsg||"Back soon!"}</div></div>
+    </div>
+  );
+
+  if(!user) return <AuthScreen onAuth={u=>{setUserState(u);if(u.email!=="guest@")LS.set("active_session",{email:u.email,ts:Date.now()});}} />;
+
+  // Exam flows
+  if(examFlow?.stage==="instructions") return (
+    <InstructionScreen exam={examFlow.exam} initialQuestions={examFlow.questions} onBack={()=>setExamFlow(null)} onStart={()=>{
+      const questions=examFlow.questions||buildExam(examFlow.exam);
+      setExamFlow({stage:"active",exam:examFlow.exam,questions});
+    }} />
+  );
+
+  if(examFlow?.stage==="active") return (
+    <ActiveExam candidate={user.name} exam={examFlow.exam} questions={examFlow.questions} onSubmit={r=>{
+      const res={...r,ts:Date.now()};
+      const updUser={...user,data:{...user.data,results:[res,...(user.data?.results||[])].slice(0,100),xp:(user.data?.xp||0)+50}};
+      setUser(updUser);
+      setExamFlow({stage:"result",result:res});
+    }} />
+  );
+
+  if(examFlow?.stage==="result") return (
+    <ResultScreen result={examFlow.result} onBack={()=>{setExamFlow(null);setScreen("home");}} onRetake={()=>{
+      const questions=buildExam(examFlow.result.exam);
+      setExamFlow({stage:"active",exam:examFlow.result.exam,questions});
+    }} />
+  );
+
+  const renderScreen=()=>{
+    if(screen==="goals") return <GoalsScreen user={user} setUser={setUser} onBack={()=>nav("home")} />;
+    if(screen==="upgrade") return <UpgradeScreen user={user} setUser={setUser} onBack={()=>nav("home")} />;
+    if(screen==="pyq") return <PYQImportScreen onBack={()=>nav("home")} onStartExam={exam=>{setExamFlow({stage:"instructions",exam,questions:exam.customQuestions});}} />;
+    return <HomeScreen user={user} ctrl={ctrl} onSelectExam={e=>{setExamFlow({stage:"instructions",exam:e});}} onOpenPYQ={()=>nav("pyq")} />;
+  };
+
+  const NAV=[{id:"home",label:"Home",icon:"H"},{id:"goals",label:"Goals",icon:"G"},{id:"upgrade",label:user.plan==="paid"&&user.planExpiry>Date.now()?"Premium":"Upgrade",icon:"U"}];
+
+  return (
+    <div style={{height:"100vh",background:"#08101a",display:"flex",flexDirection:"column",overflow:"hidden"}}>
+      <div style={{flex:1,overflow:"hidden",position:"relative"}}>{renderScreen()}</div>
+      <div style={{background:"#060c18",borderTop:"1px solid #1a2840",display:"flex",flexShrink:0}}>
+        {NAV.map(n=>(
+          <button key={n.id} onClick={()=>nav(n.id)} style={{flex:1,padding:"10px 4px 8px",background:"none",border:"none",borderTop:`2px solid ${screen===n.id?"#6366f1":"transparent"}`,color:screen===n.id?"#6366f1":"#8892b0",fontSize:10,fontWeight:700,cursor:"pointer"}}>
+            {n.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
